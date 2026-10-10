@@ -17,7 +17,7 @@ hand-typed `UPDATE` can't corrupt the books.
 
 ![Tally console](docs/console.jpg)
 
-*The built-in console (`/`): live reconciliation status, a journal-entry editor that totals debits and credits as you type, statements with running balances, holds, and a button that replays the last request with the same idempotency key.*
+*The built-in console (`/`): reconciliation status (re-checked every minute and after each write), a journal-entry editor that totals debits and credits as you type, statements with running balances, holds, and a button that replays the last request with the same idempotency key.*
 
 ## Double-entry in 30 seconds
 
@@ -262,6 +262,25 @@ Statements and the transaction feed read straight from an index, so page 1,000 c
 `OFFSET`. Holds are indexed only by account, so each page sorts that account's holds; that's cheap at thousands
 per account, and an `(account_id, created_at, id)` index would fix it if accounts ever have millions.
 
+## Console
+
+The console is a thin client over the same public API, in plain JavaScript modules with no build step. It's
+small, but it has to get the same details right as any client that moves money:
+
+- **One idempotency key per user intent, not per request.** A double click or a retry after a timeout reuses
+  the key, so the server moves the money once; the key is retired only after a definite answer
+  ([`actions.js`](src/tally/static/actions.js)). Before this, a double-clicked "Post transfer" posted twice.
+- **No floats between the user and the API.** Typed amounts are parsed as exact decimals into minor units using
+  each currency's own digits (2 for USD, 0 for JPY, 3 for KWD), and input that isn't exact (`1.005` dollars) is
+  refused rather than rounded ([`money.js`](src/tally/static/money.js)).
+- **Polling that doesn't hurt the database.** Lists refresh every 4 s, never overlap, and re-render only when the
+  data changed. Reconciliation scans every entry (1.5 s at 1.4M entries), so it runs every minute and after each
+  write instead of on every poll.
+- **Defense in depth.** Everything rendered is HTML-escaped, and the page is served with a Content-Security-Policy
+  that only allows its own scripts, so an escaping slip still couldn't run injected code. Files are served
+  `Cache-Control: no-cache` (a cheap 304 when unchanged), so after a deploy a browser can't run a cached
+  `app.js` against a new `index.html`.
+
 ## Run it
 
 ```bash
@@ -308,11 +327,12 @@ because a database that already ran a migration never sees later edits to it.
 
 ```bash
 pytest -q        # starts a throwaway postgres:17 container, or set TALLY_TEST_DATABASE_URL
+node --test 'tests/js/*.test.js'   # the console's money and idempotency logic (Node 22+, no npm install)
 # Docker Desktop on macOS without the default socket enabled also needs:
 # export DOCKER_HOST=unix://$HOME/.docker/run/docker.sock
 ```
 
-157 tests, all against a real PostgreSQL, because the rules under test live in the database:
+160 Python tests, all against a real PostgreSQL because the rules under test live in the database, plus 11 for the console's JavaScript:
 
 | Suite | What it covers |
 |---|---|
@@ -323,6 +343,7 @@ pytest -q        # starts a throwaway postgres:17 container, or set TALLY_TEST_D
 | `test_api.py` (9) | HTTP contract, idempotent replay, key reuse, problem details, pagination, holds, reconciliation |
 | `test_api_errors.py` (21) | A real row lock becomes `503 LOCK_TIMEOUT`; timeouts, pool exhaustion and outages become 503s; constraint names and crashes don't leak; oversized and chunked bodies get 413; naive timestamps and forged cursors are rejected; paging 120 holds that share one timestamp; optional idempotency; `Location` headers |
 | `test_cli.py` (16) | Exit codes (0 / 1 for discrepancies / 2 for a database that's down, unmigrated or edited), fast failure without a pool timeout, demo refusing a non-empty ledger, rolling back when it fails halfway, two demos at once seeding once, argument and config validation, Ctrl-C |
+| `test_console.py` (3), `tests/js/` (11) | The console's CSP and cache revalidation; exact money parsing and formatting per currency; one idempotency key per intent (double clicks send one request, retries reuse the key, definite answers retire it) |
 | `test_idempotency.py` (8) | Run once and replay, key reuse, per-operation scope, failed requests not remembered, a retry racing the original, a key purged mid-claim, batched purge |
 | `test_reconciliation.py` (9) | Damages the ledger past every trigger (replica mode) and checks each kind of damage is reported; capped lists with exact totals; one consistent snapshot while transfers commit |
 | `test_migrations.py` (10) | Ordered, idempotent migrations; valid concurrent indexes; the hot queries use them; four instances migrating at once without deadlocking; edited migrations refused |
@@ -350,7 +371,7 @@ src/tally/
 ├── db.py                   connection pool with timeouts and idle checks, deadlock retry, migration runner
 ├── api.py, schemas.py      FastAPI routes, Pydantic models, RFC 9457 errors
 ├── cli.py                  tally migrate | serve | reconcile | demo
-└── static/                 the console (plain JS, no build step)
+└── static/                 the console (plain JS modules, no build step)
 scripts/load_test.py        concurrent load test + conservation check
 scripts/index_benchmark.py  EXPLAIN ANALYZE before/after migration 002 on 2M entries
 ```
