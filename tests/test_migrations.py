@@ -5,7 +5,7 @@ import uuid
 import psycopg
 import pytest
 
-from tally.db import _migration_files, _statements, migrate
+from tally.db import MigrationError, _migration_files, _statements, migrate
 
 INDEXES = ("entries_by_account_time", "transactions_by_posted_at")
 ALL_VERSIONS = [version for version, _ in _migration_files()]
@@ -94,3 +94,33 @@ def test_instances_starting_at_the_same_time_migrate_once_without_deadlocking(sc
 
     assert sorted(len(r) for r in results) == [0, 0, 0, len(ALL_VERSIONS)]  # one instance did all the work
     assert applied(scratch_database) == ALL_VERSIONS
+
+
+def test_editing_an_already_applied_migration_is_refused(scratch_database):
+    migrate(scratch_database)
+    with psycopg.connect(scratch_database) as conn:  # as if 001's file had been edited since
+        conn.execute("UPDATE schema_migrations SET checksum = 'something else' WHERE version = '001_ledger'")
+
+    with pytest.raises(MigrationError, match="001_ledger was changed after it was applied"):
+        migrate(scratch_database)
+
+
+def test_databases_migrated_before_checksums_existed_get_them_filled_in(scratch_database):
+    migrate(scratch_database)
+    with psycopg.connect(scratch_database) as conn:  # the table as older versions created it
+        conn.execute("ALTER TABLE schema_migrations DROP COLUMN checksum")
+
+    assert migrate(scratch_database) == []
+    with psycopg.connect(scratch_database) as conn:
+        missing = conn.execute("SELECT count(*) FROM schema_migrations WHERE checksum IS NULL").fetchone()[0]
+    assert missing == 0
+
+
+def test_an_unknown_target_version_is_an_error(scratch_database):
+    with pytest.raises(ValueError, match="unknown migration"):
+        migrate(scratch_database, until="999_typo")
+
+
+def test_function_bodies_are_refused_in_no_transaction_files():
+    with pytest.raises(ValueError, match="function bodies"):
+        _statements("-- migration: no-transaction\nCREATE FUNCTION f() RETURNS int AS $$ SELECT 1; $$ LANGUAGE sql;")

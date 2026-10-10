@@ -91,7 +91,12 @@ def create_app(settings: Settings | None = None, *, run_migrations: bool = True,
     async def lifespan(app: FastAPI):
         if run_migrations:
             migrate(settings.database_url)
-        db = Database(settings.database_url, max_size=settings.pool_size)
+        db = Database(
+            settings.database_url,
+            max_size=settings.pool_size,
+            lock_timeout_ms=settings.lock_timeout_ms,
+            statement_timeout_ms=settings.statement_timeout_ms,
+        )
         app.state.db = db
         app.state.ledger = Ledger()
         stop = threading.Event()

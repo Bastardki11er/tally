@@ -46,7 +46,13 @@ def main(argv: list[str] | None = None) -> int:
         uvicorn.run("tally.api:create_app", factory=True, host=args.host, port=args.port, workers=args.workers)
         return 0
 
-    db = Database(settings.database_url, min_size=1, max_size=2)
+    db = Database(
+        settings.database_url,
+        min_size=1,
+        max_size=2,
+        lock_timeout_ms=settings.lock_timeout_ms,
+        statement_timeout_ms=settings.statement_timeout_ms,
+    )
     try:
         if args.command == "reconcile":
             from .reconciliation import reconcile
