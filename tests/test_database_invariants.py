@@ -37,7 +37,7 @@ def test_history_is_append_only(raw, payment, statement):
 
 
 def test_an_unbalanced_transaction_fails_at_commit(raw, wallet):
-    alice, bob = wallet("alice"), wallet("bob")
+    alice, bob = wallet("alice", funded=1_000), wallet("bob")
     txn = raw.execute("INSERT INTO transactions DEFAULT VALUES RETURNING id").fetchone()[0]
     raw.execute(
         "INSERT INTO entries (transaction_id, account_id, direction, amount, currency, balance_after) VALUES "
@@ -64,16 +64,22 @@ def test_entries_must_use_their_accounts_currency(raw, wallet):
     with pytest.raises(psycopg.errors.ForeignKeyViolation):
         raw.execute(
             "INSERT INTO entries (transaction_id, account_id, direction, amount, currency, balance_after) "
-            "VALUES (%s, %s, 'debit', 100, 'EUR', 0)",
+            "VALUES (%s, %s, 'credit', 100, 'EUR', 0)",
             (txn, alice["id"]),
         )
 
 
 def test_a_protected_account_can_never_go_negative(raw, wallet):
     alice = wallet("alice", funded=100)
+    txn = raw.execute("INSERT INTO transactions DEFAULT VALUES RETURNING id").fetchone()[0]
 
+    # Applying the entry moves the balance at once, and the CHECK refuses -1.
     with pytest.raises(psycopg.errors.CheckViolation, match="accounts_no_overdraft"):
-        raw.execute("UPDATE accounts SET balance = -1 WHERE id = %s", (alice["id"],))
+        raw.execute(
+            "INSERT INTO entries (transaction_id, account_id, direction, amount, currency, balance_after) "
+            "VALUES (%s, %s, 'debit', 101, 'USD', 0)",
+            (txn, alice["id"]),
+        )
 
 
 def test_a_transaction_cannot_be_reversed_twice_even_by_hand(raw, payment):
@@ -182,7 +188,7 @@ def insert_transfer(conn, debit_id, credit_id, posted_at=None) -> list:
 
 
 def test_entry_timestamps_are_stamped_by_the_database(raw, wallet):
-    alice, bob = wallet("alice"), wallet("bob")
+    alice, bob = wallet("alice", funded=100), wallet("bob")
 
     stamped = insert_transfer(raw, alice["id"], bob["id"], posted_at=datetime(2000, 1, 1, tzinfo=UTC))
 
@@ -190,7 +196,7 @@ def test_entry_timestamps_are_stamped_by_the_database(raw, wallet):
 
 
 def test_entry_timestamps_never_go_backwards_within_an_account(raw, wallet):
-    alice, bob = wallet("alice"), wallet("bob")
+    alice, bob = wallet("alice", funded=100), wallet("bob")
     # Simulate a server clock that was ahead and then stepped back: plant an entry an
     # hour in the future, bypassing the trigger the way a bulk restore would.
     raw.execute("SET LOCAL session_replication_role = replica")
@@ -213,3 +219,54 @@ def test_metadata_must_be_a_small_json_object(raw, metadata):
             "INSERT INTO accounts (name, type, currency, metadata) VALUES ('x', 'asset', 'USD', %s::jsonb)",
             (metadata,),
         )
+
+
+# --- rules added by migration 005: balances are derived, never written ----------------
+
+
+@pytest.mark.parametrize("column", ["balance", "held"])
+def test_balances_cannot_be_edited_directly(raw, wallet, column):
+    alice = wallet("alice", funded=100)
+
+    with pytest.raises(psycopg.errors.ObjectNotInPrerequisiteState, match="derived"):
+        raw.execute(f"UPDATE accounts SET {column} = {column} + 1 WHERE id = %s", (alice["id"],))
+
+
+def test_a_new_account_cannot_start_with_money(raw):
+    with pytest.raises(psycopg.errors.ObjectNotInPrerequisiteState, match="zero balance"):
+        raw.execute("INSERT INTO accounts (name, type, currency, balance) VALUES ('x', 'liability', 'USD', 500)")
+
+
+def test_entries_written_by_hand_still_move_balances_and_reconcile(raw, db, wallet):
+    from tally.reconciliation import reconcile
+
+    alice, bob = wallet("alice", funded=1_000), wallet("bob")
+
+    insert_transfer(raw, alice["id"], bob["id"])  # 1 cent, with a bogus balance_after of 0
+    raw.commit()
+
+    balances = dict(raw.execute("SELECT id, balance FROM accounts WHERE id = ANY(%s)", ([alice["id"], bob["id"]],)))
+    last = raw.execute(
+        "SELECT balance_after FROM entries WHERE account_id = %s ORDER BY id DESC LIMIT 1", (alice["id"],)
+    ).fetchone()[0]
+    assert balances == {alice["id"]: 999, bob["id"]: 1}
+    assert last == 999  # computed by the database, not taken from the INSERT
+    assert db.run(reconcile)["ok"]
+
+
+def test_holds_written_by_hand_still_move_the_held_amount(raw, db, wallet):
+    from tally.reconciliation import reconcile
+
+    alice = wallet("alice", funded=1_000)
+    hold = raw.execute(
+        "INSERT INTO holds (account_id, amount, expires_at) VALUES (%s, 300, now() + interval '1 day') RETURNING id",
+        (alice["id"],),
+    ).fetchone()[0]
+    held_while_active = raw.execute("SELECT held FROM accounts WHERE id = %s", (alice["id"],)).fetchone()[0]
+
+    raw.execute("UPDATE holds SET status = 'voided' WHERE id = %s", (hold,))
+    raw.commit()
+
+    assert held_while_active == 300
+    assert raw.execute("SELECT held FROM accounts WHERE id = %s", (alice["id"],)).fetchone()[0] == 0
+    assert db.run(reconcile)["ok"]

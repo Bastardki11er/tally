@@ -51,7 +51,7 @@ sum, which is what the reconciliation report checks.
 | Protected accounts never go negative | `CHECK (allow_negative OR balance - held >= 0)`, plus a service-level check under row lock | `test_a_protected_account_can_never_go_negative`, `test_concurrent_withdrawals_never_overdraw` |
 | A transaction is reversed at most once | `UNIQUE (reverses_id)`, plus a row lock on the original | `test_a_transaction_reversed_concurrently_is_reversed_once` |
 | A retried request moves money once | Idempotency key claimed in the **same** DB transaction as the money movement | `test_concurrent_requests_with_one_idempotency_key_move_money_once` |
-| Stored balances equal the sum of entries | Updated under lock in the posting transaction; independently re-derived by `/v1/reconciliation` | Hypothesis state machine, after every step |
+| Stored balances equal the sum of entries; `held` equals the sum of active holds | **Derived by triggers**: inserting an entry moves its account's balance and fills in `balance_after`, settling a hold releases its amount, and direct writes to `balance`/`held` are refused (migration 005). `/v1/reconciliation` re-derives both independently | `test_balances_cannot_be_edited_directly`, `test_entries_written_by_hand_still_move_balances_and_reconcile`; the Hypothesis state machine after every step |
 | History can't be wiped with `TRUNCATE` either (it skips row triggers) | Statement-level `BEFORE TRUNCATE` triggers, which also fire through `CASCADE` | `test_history_cannot_be_wiped_with_truncate` (4 cases) |
 | An account's type and currency never change (changing the type would flip the meaning of its whole balance) | `BEFORE UPDATE OF type, currency` trigger | `test_an_accounts_type_and_currency_are_fixed` |
 | Settled holds are final; an active hold keeps its account and amount | Lifecycle trigger on `holds`, plus no `DELETE`/`TRUNCATE` | `test_a_settled_hold_cannot_be_reopened`, `test_holds_cannot_be_deleted` |
@@ -108,7 +108,7 @@ erDiagram
 Design choices you can see in the schema ([`migrations/001_ledger.sql`](migrations/001_ledger.sql)):
 
 - **Money is `BIGINT` minor units**, never floats (`0.1 + 0.2 != 0.3`).
-- **`balance` is stored, not computed on every read.** Reading a balance is a primary-key lookup instead of summing the entire history. Reconciliation catches any drift between the two.
+- **`balance` is stored, not computed on every read,** so reading it is a primary-key lookup instead of summing the entire history. A trigger on `entries` keeps it in step with every insert, which makes it a cache that can't go stale; reconciliation still re-derives it from scratch as an independent check.
 - **`balance_after` on every entry** gives statements a running balance and answers "what was the balance on March 1st?" with one indexed lookup.
 - **`clock_timestamp()` instead of `now()`** for `posted_at`. `now()` is the start of the database transaction, which can be earlier than the moment the row lock was acquired. That would let a later entry carry an earlier timestamp and break point-in-time balances.
 - **A partial index** (`WHERE status = 'active'`) keeps the hold-expiry scan small no matter how many settled holds pile up.
@@ -149,7 +149,7 @@ runner now polls with `pg_try_advisory_lock()`, and
 Every operation locks the account rows it touches with `SELECT ... FOR UPDATE`, **always in ascending
 id order**. That ordering is what prevents deadlocks: A→B and B→A transfers at the same time queue up
 instead of each holding one lock and waiting for the other (`test_opposite_direction_transfers_do_not_deadlock`).
-Balances are read and written under the same lock, so no update is lost, and the code doesn't need
+A balance is checked and changed under the same lock, so no update is lost, and the code doesn't need
 `SERIALIZABLE` isolation plus retry loops. Deadlock and serialization errors are still retried
 transparently as a safety net.
 
@@ -173,19 +173,22 @@ insufficient funds) is not stored, so it can be retried with the same key once t
 
 [`scripts/load_test.py`](scripts/load_test.py) funds 200 wallets, fires 10,000 concurrent transfers in two
 patterns, then checks that reconciliation is clean and that the wallets still hold exactly the money
-deposited. Three runs on an Apple M5 laptop (app with 4 worker processes, Postgres 17, and the load
-generator all on the same machine), 100 concurrent clients:
+deposited. Measured on an Apple M5 laptop (app with 4 worker processes, Postgres 17, and the load generator
+all on the same machine), 100 concurrent clients; throughput over seven runs, latency over the last three:
 
 | Scenario | Throughput | p50 | p99 |
 |---|---|---|---|
-| **Spread**: random wallet to wallet | 3,050 – 3,150 transfers/s | 30 ms | 67 – 69 ms |
-| **Hotspot**: everyone pays one merchant | 1,590 – 1,640 transfers/s | 34 – 41 ms | 290 – 350 ms |
+| **Spread**: random wallet to wallet | 3,200 – 3,560 transfers/s | 27 – 29 ms | 60 – 63 ms |
+| **Hotspot**: everyone pays one merchant | 1,570 – 1,820 transfers/s | 27 – 30 ms | 350 – 400 ms |
 
-Every run: 20,000 transfers, reconciliation clean, money conserved.
+Every run: 20,000 transfers, reconciliation clean, money conserved. Moving balance updates into the database
+(migration 005) made both scenarios faster than before (3,050–3,150 and about 1,580/s), because each transfer
+now makes one fewer round trip, and that round trip used to happen while holding the account locks.
 
-**The hotspot is the instructive number.** Spread traffic scales with worker processes (about 1,500/s with
-one worker, 3,100/s with four). Hotspot traffic doesn't, because every transfer needs the merchant's row
-lock: about 1,600 transfers/s is that one row's ceiling, and p99 latency grows 4–5x as requests queue behind it.
+**The hotspot is the instructive number.** Spread traffic grows with the number of worker processes (it
+roughly doubled going from one worker to four). Hotspot traffic doesn't, because every transfer needs the
+merchant's row lock: about 1,600–1,800 transfers/s is that one row's ceiling, and p99 latency is 6x the spread
+case as requests queue behind it.
 Ways out, depending on the business: split the merchant into N sub-accounts that are summed for
 reporting; credit the merchant asynchronously in batches from a settlement queue; or keep the hot balance
 in a separate counter and fold it into the ledger periodically. Each one gives up immediate,
@@ -254,13 +257,13 @@ because a database that already ran a migration never sees later edits to it.
 pytest -q        # starts a throwaway postgres:17 container, or set TALLY_TEST_DATABASE_URL
 ```
 
-87 tests, all against a real PostgreSQL, because the rules under test live in the database:
+102 tests, all against a real PostgreSQL, because the rules under test live in the database:
 
 | Suite | What it covers |
 |---|---|
-| `test_transactions.py` (12) | Deposits, multi-leg fees, per-currency balancing, overdrafts, reversals, statements, point-in-time balances |
-| `test_holds.py` (7) | Authorize, partial capture, void, expiry, capture on debit-normal accounts, double settlement |
-| `test_database_invariants.py` (25) | **Raw SQL that bypasses the app** to try to break each rule, and gets rejected |
+| `test_transactions.py` (18) | Deposits, multi-leg fees, per-currency balancing, overdrafts, reversals, statements, point-in-time balances, leg validation, entry-by-entry overdraft checks |
+| `test_holds.py` (11) | Authorize, partial capture, void, expiry, capture on debit-normal accounts, double settlement, capturing the last of the funds, expiry and amount validation |
+| `test_database_invariants.py` (30) | **Raw SQL that bypasses the app** to try to break each rule, and gets rejected |
 | `test_concurrency.py` (4) | 50 threads draining one account, opposite-direction transfers, one idempotency key from 20 threads, concurrent reversals |
 | `test_api.py` (9) | HTTP contract, idempotent replay, key reuse, problem details, pagination, holds, reconciliation |
 | `test_migrations.py` (10) | Ordered, idempotent migrations; valid concurrent indexes; the hot queries use them; four instances migrating at once without deadlocking; edited migrations refused |
@@ -280,8 +283,9 @@ migrations/001_ledger.sql   schema, constraints, triggers: the rules of the ledg
 migrations/002_*.sql        indexes for the slow queries, built CONCURRENTLY
 migrations/003_*, 004_*     hardening: TRUNCATE guard, fixed account identity, hold lifecycle,
                             DB-stamped timestamps, metadata CHECKs (added NOT VALID, then validated)
+migrations/005_*            balances and held amounts maintained by triggers; direct writes refused
 src/tally/
-├── ledger.py               posting, transfers, holds, reversals, statements (ordered row locks)
+├── ledger.py               validation, ordered row locks, posting, holds, reversals, statements
 ├── idempotency.py          idempotency keys in the same transaction as the operation
 ├── reconciliation.py       re-derives all balances in a REPEATABLE READ snapshot
 ├── db.py                   connection pool with timeouts and idle checks, deadlock retry, migration runner
