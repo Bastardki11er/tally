@@ -179,7 +179,7 @@ yet; when it does, the client id must become part of the key so one client can n
 
 ## Reconciliation
 
-`GET /v1/reconciliation` (or `tally reconcile`, which exits 1 on any finding) re-derives the books from the raw
+`GET /v1/reconciliation` (or `tally reconcile`, which exits 1 on any finding and 2 if it couldn't run) re-derives the books from the raw
 entries and holds without trusting any stored total. The triggers already enforce every rule on each write,
 but triggers can be bypassed: a superuser in `session_replication_role = replica` mode (as bulk loads and some
 restore tools use) skips all of them, foreign keys included. So the report re-checks each rule independently:
@@ -279,6 +279,12 @@ tally migrate && tally demo && tally serve
 tally reconcile                        # exit code 1 if anything disagrees
 ```
 
+Exit codes are meant for schedulers: `0` done, `1` reconciliation found discrepancies, `2` the command couldn't
+run (bad flag or configuration, database unreachable or not migrated, an edited migration). A cron job that pages
+on `1` therefore never pages "the books are wrong" because the database was down. Operator mistakes print one
+line; only bugs print a traceback. `tally demo` seeds in a single transaction and only into an empty ledger, so
+running it twice, or killing it halfway, leaves nothing duplicated or half-written.
+
 | Variable | Default | |
 |---|---|---|
 | `TALLY_DATABASE_URL` | `postgresql://tally:tally@localhost:5432/tally` | Never printed: `Settings` redacts the password in logs and tracebacks |
@@ -302,9 +308,11 @@ because a database that already ran a migration never sees later edits to it.
 
 ```bash
 pytest -q        # starts a throwaway postgres:17 container, or set TALLY_TEST_DATABASE_URL
+# Docker Desktop on macOS without the default socket enabled also needs:
+# export DOCKER_HOST=unix://$HOME/.docker/run/docker.sock
 ```
 
-141 tests, all against a real PostgreSQL, because the rules under test live in the database:
+157 tests, all against a real PostgreSQL, because the rules under test live in the database:
 
 | Suite | What it covers |
 |---|---|
@@ -314,6 +322,7 @@ pytest -q        # starts a throwaway postgres:17 container, or set TALLY_TEST_D
 | `test_concurrency.py` (4) | 50 threads draining one account, opposite-direction transfers, one idempotency key from 20 threads, concurrent reversals |
 | `test_api.py` (9) | HTTP contract, idempotent replay, key reuse, problem details, pagination, holds, reconciliation |
 | `test_api_errors.py` (21) | A real row lock becomes `503 LOCK_TIMEOUT`; timeouts, pool exhaustion and outages become 503s; constraint names and crashes don't leak; oversized and chunked bodies get 413; naive timestamps and forged cursors are rejected; paging 120 holds that share one timestamp; optional idempotency; `Location` headers |
+| `test_cli.py` (16) | Exit codes (0 / 1 for discrepancies / 2 for a database that's down, unmigrated or edited), fast failure without a pool timeout, demo refusing a non-empty ledger, rolling back when it fails halfway, two demos at once seeding once, argument and config validation, Ctrl-C |
 | `test_idempotency.py` (8) | Run once and replay, key reuse, per-operation scope, failed requests not remembered, a retry racing the original, a key purged mid-claim, batched purge |
 | `test_reconciliation.py` (9) | Damages the ledger past every trigger (replica mode) and checks each kind of damage is reported; capped lists with exact totals; one consistent snapshot while transfers commit |
 | `test_migrations.py` (10) | Ordered, idempotent migrations; valid concurrent indexes; the hot queries use them; four instances migrating at once without deadlocking; edited migrations refused |
