@@ -327,31 +327,40 @@ because a database that already ran a migration never sees later edits to it.
 
 ```bash
 pytest -q        # starts a throwaway postgres:17 container, or set TALLY_TEST_DATABASE_URL
+pytest -q --cov  # plus branch coverage; fails under 90% (CI runs this)
+pytest tests/test_invariants.py --hypothesis-profile=thorough   # 500 random sequences instead of 40
 node --test 'tests/js/*.test.js'   # the console's money and idempotency logic (Node 22+, no npm install)
 # Docker Desktop on macOS without the default socket enabled also needs:
 # export DOCKER_HOST=unix://$HOME/.docker/run/docker.sock
 ```
 
-160 Python tests, all against a real PostgreSQL because the rules under test live in the database, plus 11 for the console's JavaScript:
+172 Python tests, all against a real PostgreSQL because the rules under test live in the database, plus 11 for the console's JavaScript. Branch coverage is 98%; warnings fail the run.
 
 | Suite | What it covers |
 |---|---|
-| `test_transactions.py` (18) | Deposits, multi-leg fees, per-currency balancing, overdrafts, reversals, statements, point-in-time balances, leg validation, entry-by-entry overdraft checks |
-| `test_holds.py` (12) | Authorize, partial capture, void, expiry in bounded batches, capture on debit-normal accounts, double settlement, capturing the last of the funds, expiry and amount validation |
+| `test_transactions.py` (24) | Deposits, multi-leg fees, per-currency balancing, overdrafts, reversals, statements, point-in-time balances, leg validation, entry-by-entry overdraft checks, single-entry posts, 404s for unknown transactions and holds |
+| `test_holds.py` (13) | Authorize, partial capture, void, expiry in bounded batches, capture on debit-normal accounts, double settlement, capturing the last of the funds, capturing into the held account, expiry and amount validation |
 | `test_database_invariants.py` (30) | **Raw SQL that bypasses the app** to try to break each rule, and gets rejected |
-| `test_concurrency.py` (4) | 50 threads draining one account, opposite-direction transfers, one idempotency key from 20 threads, concurrent reversals |
+| `test_concurrency.py` (4) | 50 threads draining one account, opposite-direction transfers, one idempotency key from 20 threads, concurrent reversals. Each race gets its own pool, filled first, so all 60 transactions really run at once, and fails if any transaction was retried, so a deadlock can't hide behind `db.run`'s retries |
 | `test_api.py` (9) | HTTP contract, idempotent replay, key reuse, problem details, pagination, holds, reconciliation |
 | `test_api_errors.py` (21) | A real row lock becomes `503 LOCK_TIMEOUT`; timeouts, pool exhaustion and outages become 503s; constraint names and crashes don't leak; oversized and chunked bodies get 413; naive timestamps and forged cursors are rejected; paging 120 holds that share one timestamp; optional idempotency; `Location` headers |
 | `test_cli.py` (16) | Exit codes (0 / 1 for discrepancies / 2 for a database that's down, unmigrated or edited), fast failure without a pool timeout, demo refusing a non-empty ledger, rolling back when it fails halfway, two demos at once seeding once, argument and config validation, Ctrl-C |
 | `test_console.py` (3), `tests/js/` (11) | The console's CSP and cache revalidation; exact money parsing and formatting per currency; one idempotency key per intent (double clicks send one request, retries reuse the key, definite answers retire it) |
 | `test_idempotency.py` (8) | Run once and replay, key reuse, per-operation scope, failed requests not remembered, a retry racing the original, a key purged mid-claim, batched purge |
+| `test_maintenance.py` (5) | The background job: drains a backlog of overdue holds in one run, forgets keys past the replay window, survives a failed run, stops promptly on shutdown |
 | `test_reconciliation.py` (9) | Damages the ledger past every trigger (replica mode) and checks each kind of damage is reported; capped lists with exact totals; one consistent snapshot while transfers commit |
 | `test_migrations.py` (10) | Ordered, idempotent migrations; valid concurrent indexes; the hot queries use them; four instances migrating at once without deadlocking; edited migrations refused |
 | `test_db.py` (8), `test_config.py` (11) | Commit/rollback, deadlock retries in fresh transactions, lock timeouts, replacing dropped connections, idle-only pings; config parsing, validation and password redaction |
-| `test_invariants.py` | **Model-based testing**: Hypothesis generates 40 random sequences of up to 30 operations (deposits, transfers, holds, captures, voids, reversals). After *every* step it checks that reconciliation is clean, the database matches an in-memory model balance for balance, and no protected account is overdrawn |
+| `test_invariants.py` | **Model-based testing**: Hypothesis generates 40 random sequences (500 with the `thorough` profile) of up to 30 operations (deposits, transfers, holds, captures, voids, reversals). After *every* step it checks that reconciliation is clean, the database matches an in-memory model balance for balance, and no protected account is overdrawn |
 
-To check that the model-based test has teeth, I planted a bug: a partial capture that releases only the
-captured amount instead of the whole hold. Hypothesis found a failing sequence in about a second.
+Tests are only worth what they catch, so the important ones were checked by planting bugs (mutation testing):
+
+- A partial capture that releases only the captured amount instead of the whole hold: Hypothesis found a failing
+  sequence in about a second.
+- 10% of transactions locking accounts in reverse order. Before the race harness was tightened, the concurrency
+  tests ran only 18 of their 60 transactions at once and let `db.run` retry the resulting deadlocks; one run in
+  six passed with the bug in place. Now all six runs fail.
+- The maintenance loop processing one batch per run, or letting an exception kill the thread: each breaks a test.
 
 CI runs lint and the full suite with Testcontainers, then boots the Docker Compose stack, runs a load test
 against it, and runs `tally reconcile` inside the container.
