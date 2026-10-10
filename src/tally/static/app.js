@@ -60,7 +60,7 @@ async function loadReconciliation() {
     badge.className = `recon ${report.ok ? "ok" : "bad"}`;
     badge.textContent = report.ok
       ? `✓ Books balanced${totals ? ` · ${totals}` : ""}`
-      : `✗ ${report.balance_mismatches.length + report.unbalanced_transactions.length + report.hold_mismatches.length} discrepancies`;
+      : `✗ ${Object.values(report.totals).reduce((sum, n) => sum + n, 0).toLocaleString()} discrepancies`;
   } catch {
     badge.className = "recon bad";
     badge.textContent = "Ledger unreachable";

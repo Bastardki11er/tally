@@ -177,6 +177,22 @@ a backlog of roughly 50M keys (about 14 hours of traffic at 1,000 transfers/s) w
 fail identically on every later run. Keys are global per operation for now. Tally has no separate API clients
 yet; when it does, the client id must become part of the key so one client can never replay another's response.
 
+## Reconciliation
+
+`GET /v1/reconciliation` (or `tally reconcile`, which exits 1 on any finding) re-derives the books from the raw
+entries and holds without trusting any stored total. The triggers already enforce every rule on each write,
+but triggers can be bypassed: a superuser in `session_replication_role = replica` mode (as bulk loads and some
+restore tools use) skips all of them, foreign keys included. So the report re-checks each rule independently:
+unbalanced and incomplete transactions, entries in the wrong currency, stored balances and held amounts against
+their sources, and every entry's `balance_after` and timestamp order, which statements and point-in-time
+balances depend on.
+
+Each check lists up to 100 findings and reports the exact total. Before these checks existed, a benchmark
+database loaded past the triggers had 2M wrong running balances, and the report said nothing about them. The
+whole report runs in one `REPEATABLE READ` snapshot, so its counts, trial balance and findings all describe the
+same moment while transfers keep committing. It has its own 10-minute statement timeout, because the
+connection default is sized for requests. On 2M entries it takes about 3.5 s.
+
 ## Load test
 
 [`scripts/load_test.py`](scripts/load_test.py) funds 200 wallets, fires 10,000 concurrent transfers in two
@@ -265,7 +281,7 @@ because a database that already ran a migration never sees later edits to it.
 pytest -q        # starts a throwaway postgres:17 container, or set TALLY_TEST_DATABASE_URL
 ```
 
-110 tests, all against a real PostgreSQL, because the rules under test live in the database:
+119 tests, all against a real PostgreSQL, because the rules under test live in the database:
 
 | Suite | What it covers |
 |---|---|
@@ -275,6 +291,7 @@ pytest -q        # starts a throwaway postgres:17 container, or set TALLY_TEST_D
 | `test_concurrency.py` (4) | 50 threads draining one account, opposite-direction transfers, one idempotency key from 20 threads, concurrent reversals |
 | `test_api.py` (9) | HTTP contract, idempotent replay, key reuse, problem details, pagination, holds, reconciliation |
 | `test_idempotency.py` (8) | Run once and replay, key reuse, per-operation scope, failed requests not remembered, a retry racing the original, a key purged mid-claim, batched purge |
+| `test_reconciliation.py` (9) | Damages the ledger past every trigger (replica mode) and checks each kind of damage is reported; capped lists with exact totals; one consistent snapshot while transfers commit |
 | `test_migrations.py` (10) | Ordered, idempotent migrations; valid concurrent indexes; the hot queries use them; four instances migrating at once without deadlocking; edited migrations refused |
 | `test_db.py` (8), `test_config.py` (11) | Commit/rollback, deadlock retries in fresh transactions, lock timeouts, replacing dropped connections, idle-only pings; config parsing, validation and password redaction |
 | `test_invariants.py` | **Model-based testing**: Hypothesis generates 40 random sequences of up to 30 operations (deposits, transfers, holds, captures, voids, reversals). After *every* step it checks that reconciliation is clean, the database matches an in-memory model balance for balance, and no protected account is overdrawn |
@@ -296,7 +313,7 @@ migrations/005_*            balances and held amounts maintained by triggers; di
 src/tally/
 ├── ledger.py               validation, ordered row locks, posting, holds, reversals, statements
 ├── idempotency.py          idempotency keys in the same transaction as the operation
-├── reconciliation.py       re-derives all balances in a REPEATABLE READ snapshot
+├── reconciliation.py       re-checks every trigger-enforced rule in one REPEATABLE READ snapshot
 ├── db.py                   connection pool with timeouts and idle checks, deadlock retry, migration runner
 ├── api.py, schemas.py      FastAPI routes, Pydantic models, RFC 9457 errors
 ├── cli.py                  tally migrate | serve | reconcile | demo
