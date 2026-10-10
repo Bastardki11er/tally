@@ -21,7 +21,7 @@ def database_url():
     if url:
         yield url
         return
-    from testcontainers.postgres import PostgresContainer
+    from testcontainers.community.postgres import PostgresContainer
 
     with PostgresContainer("postgres:17-alpine", driver=None) as postgres:
         yield postgres.get_connection_url()
