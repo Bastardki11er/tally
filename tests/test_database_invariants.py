@@ -4,6 +4,8 @@ These tests deliberately bypass the application to prove that a buggy service,
 a migration script or a tired engineer at a psql prompt still can't corrupt the books.
 """
 
+from datetime import UTC, datetime, timedelta
+
 import psycopg
 import pytest
 
@@ -90,4 +92,124 @@ def test_amounts_must_be_positive(raw, wallet):
             "INSERT INTO entries (transaction_id, account_id, direction, amount, currency, balance_after) "
             "VALUES (%s, %s, 'debit', -5, 'USD', 0)",
             (txn, alice["id"]),
+        )
+
+
+# --- rules added by migration 003 ---------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "statement",
+    ["TRUNCATE entries", "TRUNCATE transactions CASCADE", "TRUNCATE accounts CASCADE", "TRUNCATE holds"],
+)
+def test_history_cannot_be_wiped_with_truncate(raw, payment, statement):
+    # TRUNCATE skips row triggers, so it needs its own guard. CASCADE reaches entries too.
+    with pytest.raises(psycopg.errors.ObjectNotInPrerequisiteState):
+        raw.execute(statement)
+
+
+@pytest.mark.parametrize("change", ["type = 'asset'", "currency = 'EUR'"])
+def test_an_accounts_type_and_currency_are_fixed(raw, wallet, change):
+    alice = wallet("alice", funded=100)
+
+    with pytest.raises(psycopg.errors.ObjectNotInPrerequisiteState, match="cannot change"):
+        raw.execute(f"UPDATE accounts SET {change} WHERE id = %s", (alice["id"],))
+
+
+def test_other_account_details_stay_editable(raw, wallet):
+    alice = wallet("alice")
+
+    raw.execute("UPDATE accounts SET name = 'Alice B.', allow_negative = true WHERE id = %s", (alice["id"],))
+
+    assert raw.execute("SELECT name FROM accounts WHERE id = %s", (alice["id"],)).fetchone()[0] == "Alice B."
+
+
+@pytest.fixture
+def settled_hold(books, wallet):
+    alice, store = wallet("alice", funded=1_000), wallet("store")
+    hold = books.create_hold(alice["id"], 300, datetime.now(UTC) + timedelta(days=1))
+    books.capture_hold(hold["id"], store["id"])
+    return hold
+
+
+@pytest.fixture
+def active_hold(books, wallet):
+    alice = wallet("alice", funded=1_000)
+    return books.create_hold(alice["id"], 300, datetime.now(UTC) + timedelta(days=1))
+
+
+def test_a_settled_hold_cannot_be_reopened(raw, settled_hold):
+    with pytest.raises(psycopg.errors.ObjectNotInPrerequisiteState, match="already captured"):
+        raw.execute(
+            "UPDATE holds SET status = 'active', captured_transaction_id = NULL WHERE id = %s", (settled_hold["id"],)
+        )
+
+
+def test_an_active_hold_keeps_its_amount_and_tracks_updates(raw, active_hold):
+    with pytest.raises(psycopg.errors.ObjectNotInPrerequisiteState, match="cannot change"):
+        raw.execute("UPDATE holds SET amount = 1 WHERE id = %s", (active_hold["id"],))
+    raw.rollback()
+
+    updated = raw.execute(
+        "UPDATE holds SET description = 'renamed' WHERE id = %s RETURNING updated_at", (active_hold["id"],)
+    ).fetchone()[0]
+
+    assert updated > active_hold["updated_at"]
+
+
+def test_holds_cannot_be_deleted(raw, active_hold):
+    with pytest.raises(psycopg.errors.ObjectNotInPrerequisiteState, match="permanent"):
+        raw.execute("DELETE FROM holds WHERE id = %s", (active_hold["id"],))
+
+
+def insert_transfer(conn, debit_id, credit_id, posted_at=None) -> list:
+    """Hand-written transfer; posted_at is passed explicitly when given, to try to override it."""
+    txn = conn.execute("INSERT INTO transactions DEFAULT VALUES RETURNING id").fetchone()[0]
+    columns = "transaction_id, account_id, direction, amount, currency, balance_after" + (
+        ", posted_at" if posted_at else ""
+    )
+    extra = ", %s" if posted_at else ""
+    rows = []
+    for account_id, direction in ((debit_id, "debit"), (credit_id, "credit")):
+        params = (txn, account_id, direction) + ((posted_at,) if posted_at else ())
+        rows.append(
+            conn.execute(
+                f"INSERT INTO entries ({columns}) VALUES (%s, %s, %s, 1, 'USD', 0{extra}) RETURNING posted_at",
+                params,
+            ).fetchone()[0]
+        )
+    return rows
+
+
+def test_entry_timestamps_are_stamped_by_the_database(raw, wallet):
+    alice, bob = wallet("alice"), wallet("bob")
+
+    stamped = insert_transfer(raw, alice["id"], bob["id"], posted_at=datetime(2000, 1, 1, tzinfo=UTC))
+
+    assert all(abs(ts - datetime.now(UTC)) < timedelta(minutes=1) for ts in stamped)
+
+
+def test_entry_timestamps_never_go_backwards_within_an_account(raw, wallet):
+    alice, bob = wallet("alice"), wallet("bob")
+    # Simulate a server clock that was ahead and then stepped back: plant an entry an
+    # hour in the future, bypassing the trigger the way a bulk restore would.
+    raw.execute("SET LOCAL session_replication_role = replica")
+    future = insert_transfer(raw, alice["id"], bob["id"], posted_at=datetime.now(UTC) + timedelta(hours=1))
+    raw.execute("SET LOCAL session_replication_role = origin")
+
+    later = insert_transfer(raw, alice["id"], bob["id"])
+
+    assert later[0] >= future[0]
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    ['["not", "an", "object"]', '"just a string"', '{"blob": "' + "x" * 5000 + '"}'],
+    ids=["array", "string", "over-4kb"],
+)
+def test_metadata_must_be_a_small_json_object(raw, metadata):
+    with pytest.raises(psycopg.errors.CheckViolation, match="metadata_shape"):
+        raw.execute(
+            "INSERT INTO accounts (name, type, currency, metadata) VALUES ('x', 'asset', 'USD', %s::jsonb)",
+            (metadata,),
         )

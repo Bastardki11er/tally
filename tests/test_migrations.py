@@ -5,9 +5,10 @@ import uuid
 import psycopg
 import pytest
 
-from tally.db import _statements, migrate
+from tally.db import _migration_files, _statements, migrate
 
 INDEXES = ("entries_by_account_time", "transactions_by_posted_at")
+ALL_VERSIONS = [version for version, _ in _migration_files()]
 
 
 @pytest.fixture
@@ -29,9 +30,9 @@ def applied(url: str) -> list[str]:
 
 def test_migrations_apply_in_order_stop_where_asked_and_are_idempotent(scratch_database):
     assert migrate(scratch_database, until="001_ledger") == ["001_ledger"]
-    assert migrate(scratch_database) == ["002_query_indexes"]
+    assert migrate(scratch_database) == ALL_VERSIONS[1:]
     assert migrate(scratch_database) == []
-    assert applied(scratch_database) == ["001_ledger", "002_query_indexes"]
+    assert applied(scratch_database) == ALL_VERSIONS
 
 
 def test_concurrently_built_indexes_exist_and_are_valid(migrated):
@@ -91,5 +92,5 @@ def test_instances_starting_at_the_same_time_migrate_once_without_deadlocking(sc
     with ThreadPoolExecutor(max_workers=4) as pool:
         results = list(pool.map(boot, range(4)))
 
-    assert sorted(len(r) for r in results) == [0, 0, 0, 2]  # one instance did all the work
-    assert applied(scratch_database) == ["001_ledger", "002_query_indexes"]
+    assert sorted(len(r) for r in results) == [0, 0, 0, len(ALL_VERSIONS)]  # one instance did all the work
+    assert applied(scratch_database) == ALL_VERSIONS
