@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Tally Ledger Console</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span class="logo">◆</span> Tally <span class="tag">double-entry ledger</span></div>
+    <div id="recon" class="recon" title="Recomputed from raw entries every few seconds">Checking the books…</div>
+  </header>
+
+  <main class="layout">
+    <div class="stack">
+      <section class="card">
+        <div class="card-head">
+          <h2>Accounts</h2>
+          <span class="muted small">Click an account for its statement and holds</span>
+        </div>
+        <div id="accounts"></div>
+      </section>
+
+      <section class="card">
+        <div class="card-head">
+          <h2>Recent transactions</h2>
+          <span class="muted small">Append-only: corrections are reversals</span>
+        </div>
+        <div id="transactions"></div>
+      </section>
+    </div>
+
+    <aside class="stack">
+      <section class="card">
+        <nav class="tabs" role="tablist">
+          <button class="tab active" data-tab="transfer">Transfer</button>
+          <button class="tab" data-tab="journal">Journal entry</button>
+          <button class="tab" data-tab="hold">Hold</button>
+          <button class="tab" data-tab="account">New account</button>
+        </nav>
+
+        <form id="form-transfer" class="tab-panel">
+          <label>Debit account <select name="debit" class="account-select" required></select></label>
+          <label>Credit account <select name="credit" class="account-select" required></select></label>
+          <div class="row">
+            <label>Amount ($) <input name="amount" type="number" min="0.01" step="0.01" value="25.00" required></label>
+          </div>
+          <label>Description <input name="description" maxlength="500" placeholder="e.g. Alice pays Bob for dinner"></label>
+          <p class="hint">Wallets are liabilities: <b>debit</b> the payer, <b>credit</b> the payee. A deposit debits Cash and credits the wallet.</p>
+          <button class="primary" type="submit">Post transfer</button>
+        </form>
+
+        <form id="form-journal" class="tab-panel" hidden>
+          <table class="journal">
+            <thead><tr><th>Account</th><th>Debit</th><th>Credit</th><th></th></tr></thead>
+            <tbody id="journal-lines"></tbody>
+            <tfoot>
+              <tr><td><button type="button" id="add-line" class="link">+ Add line</button></td>
+                <td id="total-debit" class="num">$0.00</td><td id="total-credit" class="num">$0.00</td><td></td></tr>
+            </tfoot>
+          </table>
+          <div id="journal-balance" class="balance-check"></div>
+          <label>Description <input name="description" maxlength="500" placeholder="e.g. Payment with a 3% fee"></label>
+          <button class="primary" type="submit">Post entry</button>
+          <p class="hint">Try posting an unbalanced entry: the API rejects it, and so would the database.</p>
+        </form>
+
+        <form id="form-hold" class="tab-panel" hidden>
+          <label>Account <select name="account" class="account-select" required></select></label>
+          <div class="row">
+            <label>Amount ($) <input name="amount" type="number" min="0.01" step="0.01" value="40.00" required></label>
+            <label>Expires in
+              <select name="expires">
+                <option value="60">1 minute</option>
+                <option value="3600">1 hour</option>
+                <option value="86400" selected>1 day</option>
+                <option value="604800">7 days</option>
+              </select>
+            </label>
+          </div>
+          <label>Description <input name="description" maxlength="500" placeholder="e.g. Card authorization at a gas pump"></label>
+          <p class="hint">A hold reserves funds: the balance stays, the available amount drops. Capture or void it from the account view.</p>
+          <button class="primary" type="submit">Place hold</button>
+        </form>
+
+        <form id="form-account" class="tab-panel" hidden>
+          <label>Name <input name="name" required maxlength="200" placeholder="e.g. Carol's wallet"></label>
+          <div class="row">
+            <label>Type
+              <select name="type">
+                <option value="liability">Liability (customer wallet)</option>
+                <option value="asset">Asset (cash, receivables)</option>
+                <option value="revenue">Revenue (fees)</option>
+                <option value="expense">Expense</option>
+                <option value="equity">Equity</option>
+              </select>
+            </label>
+            <label>Currency <input name="currency" value="USD" pattern="[A-Z]{3}" maxlength="3" required></label>
+          </div>
+          <label class="check"><input type="checkbox" name="allow_negative"> Allow negative balance</label>
+          <button class="primary" type="submit">Create account</button>
+        </form>
+      </section>
+
+      <section class="card">
+        <div class="card-head"><h2>Last request</h2></div>
+        <div id="last-request" class="muted small">Requests that move money carry an Idempotency-Key. Resend one with the same key to see that nothing moves twice.</div>
+      </section>
+    </aside>
+  </main>
+
+  <footer>
+    <a href="/docs" target="_blank" rel="noopener">API docs</a>
+    <a href="/v1/reconciliation" target="_blank" rel="noopener">Reconciliation report (JSON)</a>
+    <a href="https://github.com/Bastardki11er/tally" target="_blank" rel="noopener">Source on GitHub</a>
+  </footer>
+
+  <dialog id="account-dialog">
+    <div id="account-detail"></div>
+    <div class="row end"><button id="close-dialog">Close</button></div>
+  </dialog>
+
+  <div id="toasts" aria-live="polite"></div>
+  <script type="module" src="/static/app.js"></script>
+</body>
+</html>
