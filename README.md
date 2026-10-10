@@ -166,8 +166,16 @@ database transaction** as the transfer it protects, so they commit or roll back 
 window where money moved but the key wasn't saved (or the other way round), even if the process
 crashes. Two concurrent requests with the same key are serialized by the primary key: the second
 `INSERT ... ON CONFLICT DO NOTHING` waits for the first transaction, then returns its stored response with
-`Idempotent-Replayed: true`. Reusing a key with a different body is a `422`. A failed request (say,
-insufficient funds) is not stored, so it can be retried with the same key once the account is topped up.
+`Idempotent-Replayed: true`. That wait is capped by `lock_timeout`; if the original request is still running
+when it expires, the retry gets `409 IDEMPOTENCY_KEY_IN_USE` (try again shortly) rather than a server error.
+Reusing a key with a different body is a `422`. A failed request (say, insufficient funds) is not stored, so it
+can be retried with the same key once the account is topped up.
+
+Keys are remembered for 24 hours. A background job deletes expired ones in batches of 5,000. One big `DELETE`
+would be all or nothing: Postgres deleted about 1.7M keys per second here, so with a 30-second statement timeout
+a backlog of roughly 50M keys (about 14 hours of traffic at 1,000 transfers/s) would time out, roll back, and
+fail identically on every later run. Keys are global per operation for now. Tally has no separate API clients
+yet; when it does, the client id must become part of the key so one client can never replay another's response.
 
 ## Load test
 
@@ -257,7 +265,7 @@ because a database that already ran a migration never sees later edits to it.
 pytest -q        # starts a throwaway postgres:17 container, or set TALLY_TEST_DATABASE_URL
 ```
 
-102 tests, all against a real PostgreSQL, because the rules under test live in the database:
+110 tests, all against a real PostgreSQL, because the rules under test live in the database:
 
 | Suite | What it covers |
 |---|---|
@@ -266,6 +274,7 @@ pytest -q        # starts a throwaway postgres:17 container, or set TALLY_TEST_D
 | `test_database_invariants.py` (30) | **Raw SQL that bypasses the app** to try to break each rule, and gets rejected |
 | `test_concurrency.py` (4) | 50 threads draining one account, opposite-direction transfers, one idempotency key from 20 threads, concurrent reversals |
 | `test_api.py` (9) | HTTP contract, idempotent replay, key reuse, problem details, pagination, holds, reconciliation |
+| `test_idempotency.py` (8) | Run once and replay, key reuse, per-operation scope, failed requests not remembered, a retry racing the original, a key purged mid-claim, batched purge |
 | `test_migrations.py` (10) | Ordered, idempotent migrations; valid concurrent indexes; the hot queries use them; four instances migrating at once without deadlocking; edited migrations refused |
 | `test_db.py` (8), `test_config.py` (11) | Commit/rollback, deadlock retries in fresh transactions, lock timeouts, replacing dropped connections, idle-only pings; config parsing, validation and password redaction |
 | `test_invariants.py` | **Model-based testing**: Hypothesis generates 40 random sequences of up to 30 operations (deposits, transfers, holds, captures, voids, reversals). After *every* step it checks that reconciliation is clean, the database matches an in-memory model balance for balance, and no protected account is overdrawn |
