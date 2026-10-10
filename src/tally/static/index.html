@@ -9,8 +9,9 @@
 <body>
   <header class="topbar">
     <div class="brand"><span class="logo">◆</span> Tally <span class="tag">double-entry ledger</span></div>
-    <div id="recon" class="recon" title="Recomputed from raw entries every few seconds">Checking the books…</div>
+    <button id="recon" class="recon" type="button" title="Re-derives every balance from the raw entries; click to check again">Checking the books…</button>
   </header>
+  <div id="offline" class="offline" role="alert" hidden></div>
 
   <main class="layout">
     <div class="stack">
@@ -34,24 +35,24 @@
     <aside class="stack">
       <section class="card">
         <nav class="tabs" role="tablist">
-          <button class="tab active" data-tab="transfer">Transfer</button>
-          <button class="tab" data-tab="journal">Journal entry</button>
-          <button class="tab" data-tab="hold">Hold</button>
-          <button class="tab" data-tab="account">New account</button>
+          <button class="tab active" role="tab" aria-selected="true" aria-controls="form-transfer" data-tab="transfer">Transfer</button>
+          <button class="tab" role="tab" aria-selected="false" aria-controls="form-journal" data-tab="journal">Journal entry</button>
+          <button class="tab" role="tab" aria-selected="false" aria-controls="form-hold" data-tab="hold">Hold</button>
+          <button class="tab" role="tab" aria-selected="false" aria-controls="form-account" data-tab="account">New account</button>
         </nav>
 
-        <form id="form-transfer" class="tab-panel">
+        <form id="form-transfer" class="tab-panel" role="tabpanel">
           <label>Debit account <select name="debit" class="account-select" required></select></label>
           <label>Credit account <select name="credit" class="account-select" required></select></label>
           <div class="row">
-            <label>Amount ($) <input name="amount" type="number" min="0.01" step="0.01" value="25.00" required></label>
+            <label>Amount <input name="amount" inputmode="decimal" value="25.00" required></label>
           </div>
           <label>Description <input name="description" maxlength="500" placeholder="e.g. Alice pays Bob for dinner"></label>
           <p class="hint">Wallets are liabilities: <b>debit</b> the payer, <b>credit</b> the payee. A deposit debits Cash and credits the wallet.</p>
           <button class="primary" type="submit">Post transfer</button>
         </form>
 
-        <form id="form-journal" class="tab-panel" hidden>
+        <form id="form-journal" class="tab-panel" role="tabpanel" hidden>
           <table class="journal">
             <thead><tr><th>Account</th><th>Debit</th><th>Credit</th><th></th></tr></thead>
             <tbody id="journal-lines"></tbody>
@@ -66,10 +67,10 @@
           <p class="hint">Try posting an unbalanced entry: the API rejects it, and so would the database.</p>
         </form>
 
-        <form id="form-hold" class="tab-panel" hidden>
+        <form id="form-hold" class="tab-panel" role="tabpanel" hidden>
           <label>Account <select name="account" class="account-select" required></select></label>
           <div class="row">
-            <label>Amount ($) <input name="amount" type="number" min="0.01" step="0.01" value="40.00" required></label>
+            <label>Amount <input name="amount" inputmode="decimal" value="40.00" required></label>
             <label>Expires in
               <select name="expires">
                 <option value="60">1 minute</option>
@@ -84,7 +85,7 @@
           <button class="primary" type="submit">Place hold</button>
         </form>
 
-        <form id="form-account" class="tab-panel" hidden>
+        <form id="form-account" class="tab-panel" role="tabpanel" hidden>
           <label>Name <input name="name" required maxlength="200" placeholder="e.g. Carol's wallet"></label>
           <div class="row">
             <label>Type

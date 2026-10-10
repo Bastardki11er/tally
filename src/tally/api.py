@@ -62,6 +62,13 @@ log = logging.getLogger(__name__)
 
 STATIC_DIR = Path(__file__).parent / "static"
 
+# The console loads nothing from anywhere else and never needs inline script. If a
+# value ever slipped past its HTML escaping, the browser would still refuse to run it.
+CONSOLE_CSP = (
+    "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
+    "connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+)
+
 # The largest legitimate request (100 entries plus 4 KB of metadata) is well under this.
 MAX_BODY_BYTES = 64 * 1024
 
@@ -122,6 +129,20 @@ def decode_cursor(cursor: str | None, *types: Callable[[Any], Any]) -> tuple | N
         return tuple(kind(value) for kind, value in zip(types, values, strict=True))
     except (ValueError, TypeError) as exc:
         raise unprocessable("INVALID_CURSOR", "cursor is not one this API issued") from exc
+
+
+class RevalidatedStaticFiles(StaticFiles):
+    """Static files that the browser revalidates before each use: a cheap 304 when unchanged.
+
+    There is no build step, so file names carry no content hash. Without this, a
+    browser could keep a cached app.js after a deploy and run it against the new
+    index.html (or the other way round), which breaks the page in confusing ways.
+    """
+
+    def file_response(self, *args, **kwargs):
+        response = super().file_response(*args, **kwargs)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
 
 
 class BodyTooLarge(StarletteHTTPException):
@@ -431,10 +452,11 @@ def create_app(settings: Settings | None = None, *, run_migrations: bool = True,
         return {"status": "ok"}
 
     if STATIC_DIR.is_dir():
-        app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+        app.mount("/static", RevalidatedStaticFiles(directory=STATIC_DIR), name="static")
 
         @app.get("/", include_in_schema=False)
         def console():
-            return FileResponse(STATIC_DIR / "index.html")
+            headers = {"Content-Security-Policy": CONSOLE_CSP, "Cache-Control": "no-cache"}
+            return FileResponse(STATIC_DIR / "index.html", headers=headers)
 
     return app
