@@ -8,8 +8,12 @@ Two scenarios:
            same row lock, the worst case for a ledger
 
 After each run it checks the things that must never break under load:
+  * every request got a real answer: a transfer or INSUFFICIENT_FUNDS (a wallet
+    can run dry), never a 5xx, a timeout or a dropped connection
   * /v1/reconciliation is clean (every balance equals the sum of its entries)
   * money is conserved: the wallets hold exactly what was deposited
+
+It exits 1 if any check fails, so CI can run it as a gate.
 
 Usage:
   python3 scripts/load_test.py --base-url http://localhost:8000 --requests 5000 --concurrency 50
@@ -30,6 +34,9 @@ from urllib.parse import urlparse
 
 _local = threading.local()
 
+# The only refusal a correct ledger gives under this load: a wallet ran out of money.
+EXPECTED = {"ok", "INSUFFICIENT_FUNDS"}
+
 
 def call(base, method, path, body=None, idempotent=False):
     headers = {"Content-Type": "application/json"}
@@ -46,8 +53,9 @@ def call(base, method, path, body=None, idempotent=False):
             response = conn.getresponse()
             data = response.read()
             return response.status, json.loads(data) if data else None
-        except (http.client.HTTPException, ConnectionError):
-            # Keep-alive connections the server closed while idle; reconnect and retry once.
+        except (http.client.HTTPException, OSError):
+            # A keep-alive connection the server closed while idle, or a timeout: reconnect
+            # and retry once. The same Idempotency-Key makes a retried transfer safe.
             conn.close()
             _local.conn = None
             if attempt == 1:
@@ -80,14 +88,17 @@ def run(base, label, requests, concurrency, pick):
     def one(_):
         debit, credit, amount = pick()
         started = time.perf_counter()
-        status, body = call(
-            base,
-            "POST",
-            "/v1/transfers",
-            {"debit_account_id": debit, "credit_account_id": credit, "amount": amount},
-            idempotent=True,
-        )
-        outcome = "ok" if status == 201 else (body or {}).get("code", f"HTTP {status}")
+        try:
+            status, body = call(
+                base,
+                "POST",
+                "/v1/transfers",
+                {"debit_account_id": debit, "credit_account_id": credit, "amount": amount},
+                idempotent=True,
+            )
+            outcome = "ok" if status == 201 else (body or {}).get("code", f"HTTP {status}")
+        except (http.client.HTTPException, OSError) as error:
+            outcome = f"no answer ({type(error).__name__})"
         return outcome, (time.perf_counter() - started) * 1000
 
     started = time.perf_counter()
@@ -99,7 +110,9 @@ def run(base, label, requests, concurrency, pick):
     print(f"\n[{label}] {requests} transfers, concurrency {concurrency}")
     print(f"  throughput  {requests / elapsed:,.0f} transfers/s ({elapsed:.2f} s)")
     print(f"  latency     p50 {statistics.median(latencies):.1f} ms   p95 {pct(95):.1f} ms   p99 {pct(99):.1f} ms")
-    print("  outcomes    " + ", ".join(f"{k}={v}" for k, v in sorted(Counter(o for o, _ in results).items())))
+    outcomes = Counter(o for o, _ in results)
+    print("  outcomes    " + ", ".join(f"{k}={v}" for k, v in sorted(outcomes.items())))
+    return {k: v for k, v in outcomes.items() if k not in EXPECTED}
 
 
 def main():
@@ -122,14 +135,17 @@ def main():
     def hotspot():
         return random.choice(wallets), merchant, random.randint(1, 50)
 
-    run(base, "spread", args.requests, args.concurrency, spread)
-    run(base, "hotspot", args.requests, args.concurrency, hotspot)
+    unexpected = Counter()
+    unexpected.update(run(base, "spread", args.requests, args.concurrency, spread))
+    unexpected.update(run(base, "hotspot", args.requests, args.concurrency, hotspot))
 
     _, report = call(base, "GET", "/v1/reconciliation")
     held = sum(call(base, "GET", f"/v1/accounts/{a}")[1]["balance"] for a in [*wallets, merchant])
     conserved = held == deposit * len(wallets)
     print(f"\nreconciliation ok: {report['ok']}   money conserved: {conserved} ({held} == {deposit * len(wallets)})")
-    sys.exit(0 if report["ok"] and conserved else 1)
+    # Conservation alone proves little: if every transfer failed, no money would move either.
+    print(f"unexpected outcomes: {dict(unexpected) or 'none'}")
+    sys.exit(0 if report["ok"] and conserved and not unexpected else 1)
 
 
 if __name__ == "__main__":

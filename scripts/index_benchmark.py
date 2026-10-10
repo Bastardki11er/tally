@@ -9,11 +9,13 @@ again on the same data.
 
     python scripts/index_benchmark.py postgresql://user:pass@localhost:5432/tally_bench
 
-The target database is WIPED. The bulk load skips triggers (session_replication_role
-= replica), which needs a superuser; that is fine for throwaway benchmark data,
-and the generated transactions balance anyway.
+The target database is WIPED, so the script only runs against a database whose name
+contains "bench", unless you pass --wipe. The bulk load skips triggers
+(session_replication_role = replica), which needs a superuser; that is fine for
+throwaway benchmark data, and the generated transactions balance anyway.
 """
 
+import argparse
 import statistics
 import sys
 import time
@@ -101,11 +103,17 @@ def run_cases(conn, balance_sql: str) -> list[tuple[float, str]]:
 
 
 def main() -> int:
-    if len(sys.argv) != 2:
-        print(__doc__)
-        return 2
-    url = sys.argv[1]
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("url", help="PostgreSQL URL of a throwaway database")
+    parser.add_argument("--wipe", action="store_true", help="wipe it even though its name doesn't contain 'bench'")
+    args = parser.parse_args()
+    url = args.url
     with psycopg.connect(url, autocommit=True) as conn:
+        # One mistyped URL away from someone's real ledger: make wiping it deliberate.
+        name = conn.info.dbname
+        if "bench" not in name and not args.wipe:
+            print(f"refusing to wipe database {name!r}: its name doesn't contain 'bench' (pass --wipe to insist)")
+            return 2
         conn.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
     migrate(url, until="001_ledger")
 

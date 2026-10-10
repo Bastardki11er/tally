@@ -2,7 +2,8 @@ services:
   app:
     build: .
     ports:
-      - "8000:8000"
+      # Reachable from this machine only. TALLY_PORT=8001 docker compose up if 8000 is taken.
+      - "127.0.0.1:${TALLY_PORT:-8000}:8000"
     environment:
       TALLY_DATABASE_URL: postgresql://tally:tally@postgres:5432/tally
     depends_on:
@@ -16,8 +17,15 @@ services:
       POSTGRES_PASSWORD: tally
       POSTGRES_DB: tally
     ports:
-      - "5432:5432"
+      # For psql from the host. Local only: anyone who could reach it would know the password.
+      - "127.0.0.1:${TALLY_DB_PORT:-5432}:5432"
+    volumes:
+      # A named volume keeps the ledger across `docker compose down`; `down -v` deletes it.
+      - pgdata:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD", "pg_isready", "-U", "tally"]
       interval: 3s
       retries: 20
+
+volumes:
+  pgdata:
