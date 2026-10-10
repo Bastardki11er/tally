@@ -26,6 +26,16 @@ T = TypeVar("T")
 RETRYABLE = (psycopg.errors.DeadlockDetected, psycopg.errors.SerializationFailure)
 
 
+def session_limits(
+    lock_timeout_ms: int, statement_timeout_ms: int, idle_in_transaction_timeout_ms: int = 60_000
+) -> str:
+    """libpq ``options`` that make the server enforce these limits for the whole session."""
+    return (
+        f"-c lock_timeout={lock_timeout_ms} -c statement_timeout={statement_timeout_ms} "
+        f"-c idle_in_transaction_session_timeout={idle_in_transaction_timeout_ms}"
+    )
+
+
 class Database:
     def __init__(
         self,
@@ -42,10 +52,7 @@ class Database:
         # Server-side limits on every pooled connection. Without them, a transaction
         # stuck behind a row lock (an open psql session, a hung client) waits forever
         # while holding a pool connection; enough of those and the pool runs dry.
-        limits = (
-            f"-c lock_timeout={lock_timeout_ms} -c statement_timeout={statement_timeout_ms} "
-            f"-c idle_in_transaction_session_timeout={idle_in_transaction_timeout_ms}"
-        )
+        limits = session_limits(lock_timeout_ms, statement_timeout_ms, idle_in_transaction_timeout_ms)
         self._last_used: weakref.WeakKeyDictionary[psycopg.Connection, float] = weakref.WeakKeyDictionary()
         self._check_idle_after = check_idle_after_seconds
         self.pool = ConnectionPool(
