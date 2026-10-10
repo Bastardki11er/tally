@@ -52,6 +52,11 @@ sum, which is what the reconciliation report checks.
 | A transaction is reversed at most once | `UNIQUE (reverses_id)`, plus a row lock on the original | `test_a_transaction_reversed_concurrently_is_reversed_once` |
 | A retried request moves money once | Idempotency key claimed in the **same** DB transaction as the money movement | `test_concurrent_requests_with_one_idempotency_key_move_money_once` |
 | Stored balances equal the sum of entries | Updated under lock in the posting transaction; independently re-derived by `/v1/reconciliation` | Hypothesis state machine, after every step |
+| History can't be wiped with `TRUNCATE` either (it skips row triggers) | Statement-level `BEFORE TRUNCATE` triggers, which also fire through `CASCADE` | `test_history_cannot_be_wiped_with_truncate` (4 cases) |
+| An account's type and currency never change (changing the type would flip the meaning of its whole balance) | `BEFORE UPDATE OF type, currency` trigger | `test_an_accounts_type_and_currency_are_fixed` |
+| Settled holds are final; an active hold keeps its account and amount | Lifecycle trigger on `holds`, plus no `DELETE`/`TRUNCATE` | `test_a_settled_hold_cannot_be_reopened`, `test_holds_cannot_be_deleted` |
+| Within an account, entry timestamps never go backwards (point-in-time balances depend on it) | `BEFORE INSERT` trigger stamps `posted_at` itself, never below the account's previous entry, even if the server clock steps back | `test_entry_timestamps_never_go_backwards_within_an_account` |
+| `metadata` is a JSON object of at most 4 KB | `CHECK` added `NOT VALID`, then validated in a separate migration so a large table keeps taking writes | `test_metadata_must_be_a_small_json_object` |
 
 ## Data model
 
@@ -230,13 +235,13 @@ tally reconcile                        # exit code 1 if anything disagrees
 pytest -q        # starts a throwaway postgres:17 container, or set TALLY_TEST_DATABASE_URL
 ```
 
-49 tests, all against a real PostgreSQL, because the rules under test live in the database:
+64 tests, all against a real PostgreSQL, because the rules under test live in the database:
 
 | Suite | What it covers |
 |---|---|
 | `test_transactions.py` (12) | Deposits, multi-leg fees, per-currency balancing, overdrafts, reversals, statements, point-in-time balances |
 | `test_holds.py` (7) | Authorize, partial capture, void, expiry, capture on debit-normal accounts, double settlement |
-| `test_database_invariants.py` (10) | **Raw SQL that bypasses the app** to try to break each rule, and gets rejected |
+| `test_database_invariants.py` (25) | **Raw SQL that bypasses the app** to try to break each rule, and gets rejected |
 | `test_concurrency.py` (4) | 50 threads draining one account, opposite-direction transfers, one idempotency key from 20 threads, concurrent reversals |
 | `test_api.py` (9) | HTTP contract, idempotent replay, key reuse, problem details, pagination, holds, reconciliation |
 | `test_migrations.py` (6) | Ordered, idempotent migrations; valid concurrent indexes; the hot queries use them; four instances migrating at once without deadlocking |
@@ -253,6 +258,8 @@ against it, and runs `tally reconcile` inside the container.
 ```
 migrations/001_ledger.sql   schema, constraints, triggers: the rules of the ledger
 migrations/002_*.sql        indexes for the slow queries, built CONCURRENTLY
+migrations/003_*, 004_*     hardening: TRUNCATE guard, fixed account identity, hold lifecycle,
+                            DB-stamped timestamps, metadata CHECKs (added NOT VALID, then validated)
 src/tally/
 ├── ledger.py               posting, transfers, holds, reversals, statements (ordered row locks)
 ├── idempotency.py          idempotency keys in the same transaction as the operation

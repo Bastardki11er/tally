@@ -43,8 +43,18 @@ def db(migrated):
 
 
 def reset(db: Database) -> None:
-    # TRUNCATE bypasses the append-only row triggers, which is exactly what a test reset needs.
-    db.run(lambda conn: conn.execute(f"TRUNCATE {TABLES} RESTART IDENTITY CASCADE"))
+    """Wipes every table between tests.
+
+    The ledger refuses TRUNCATE (migration 003). Replica mode skips triggers for this
+    one transaction; only a superuser can switch it on, which the test database user
+    is, and the application's database user should never be.
+    """
+
+    def wipe(conn):
+        conn.execute("SET LOCAL session_replication_role = replica")
+        conn.execute(f"TRUNCATE {TABLES} RESTART IDENTITY CASCADE")
+
+    db.run(wipe)
 
 
 @pytest.fixture(autouse=True)
