@@ -122,7 +122,7 @@ def ledger_machine(db):
         @precondition(lambda self: self.holds)
         @rule(data=st.data(), destination=accounts)
         def capture(self, data, destination):
-            hold_id = data.draw(st.sampled_from(sorted(self.holds, key=str)))
+            hold_id = data.draw(st.sampled_from(list(self.holds)))  # creation order: deterministic on replay
             account, held = self.holds[hold_id]
             if destination == account:
                 return
@@ -140,7 +140,7 @@ def ledger_machine(db):
         @precondition(lambda self: self.holds)
         @rule(data=st.data())
         def void(self, data):
-            hold_id = data.draw(st.sampled_from(sorted(self.holds, key=str)))
+            hold_id = data.draw(st.sampled_from(list(self.holds)))  # creation order: deterministic on replay
             account, held = self.holds.pop(hold_id)
             books.void_hold(hold_id)
             self.model[account]["held"] -= held
