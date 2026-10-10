@@ -222,22 +222,45 @@ per-transaction consistency on that one account.
 
 | Method | Path | |
 |---|---|---|
-| `POST` | `/v1/accounts` | Open an account (type, currency, `allow_negative`) |
+| `POST` | `/v1/accounts` 🗝️ | Open an account (type, currency, `allow_negative`) |
 | `GET` | `/v1/accounts`, `/v1/accounts/{id}` | Balance, held and available amounts |
-| `GET` | `/v1/accounts/{id}/entries?cursor=` | Statement, newest first, running balance, keyset pagination |
-| `GET` | `/v1/accounts/{id}/balance?as_of=` | Balance at any past moment |
+| `GET` | `/v1/accounts/{id}/entries` | Statement, newest first, with the running balance |
+| `GET` | `/v1/accounts/{id}/balance?as_of=` | Balance at any past moment (`as_of` must carry a time zone) |
+| `GET` | `/v1/accounts/{id}/holds?status=` | The account's holds, newest first |
 | `POST` | `/v1/transfers` 🔑 | Debit one account, credit another |
 | `POST` | `/v1/transactions` 🔑 | Any balanced set of 2–100 entries (fees, splits, multi-currency) |
 | `GET` | `/v1/transactions`, `/v1/transactions/{id}` | Recent activity; one transaction with its entries |
 | `POST` | `/v1/transactions/{id}/reversal` 🔑 | Post the mirror image of a transaction |
 | `POST` | `/v1/holds` 🔑 | Reserve funds (card authorization), with expiry |
 | `POST` | `/v1/holds/{id}/capture` 🔑 | Settle a hold, optionally for less; the rest is released |
-| `POST` | `/v1/holds/{id}/void` | Release a hold |
+| `POST` | `/v1/holds/{id}/void` 🗝️ | Release a hold |
 | `GET` | `/v1/reconciliation` | Re-derive every balance from raw entries and report any mismatch |
 
-🔑 = requires `Idempotency-Key`. Errors are [RFC 9457](https://www.rfc-editor.org/rfc/rfc9457) problem details with a stable `code`
-(`INSUFFICIENT_FUNDS`, `UNBALANCED`, `ALREADY_REVERSED`, `HOLD_EXPIRED`, `IDEMPOTENCY_KEY_REUSED`, ...).
-Interactive docs are at `/docs`.
+🔑 = requires `Idempotency-Key`; 🗝️ = accepts one. Without a key, a retried void whose first attempt
+succeeded gets `409 HOLD_NOT_ACTIVE`, and a retried account creation opens a second account. Created
+resources come back with a `Location` header. Interactive docs are at `/docs`.
+
+**Errors.** Every failure is an [RFC 9457](https://www.rfc-editor.org/rfc/rfc9457) problem document
+(`application/problem+json`) with a stable `code`, including 404s for unknown routes and 405s. The status says
+what the client should do:
+
+| Status | Meaning | Examples |
+|---|---|---|
+| `409` / `422` | Your request can't succeed as sent; don't retry it unchanged | `INSUFFICIENT_FUNDS`, `UNBALANCED`, `HOLD_EXPIRED`, `IDEMPOTENCY_KEY_REUSED`, `VALIDATION_ERROR`, `INVALID_CURSOR` |
+| `413` | Body over 64 KB, refused before it's read (chunked bodies are counted as they arrive) | `CONTENT_TOO_LARGE` |
+| `503` + `Retry-After` | Temporary; retry with the same `Idempotency-Key` | `LOCK_TIMEOUT`, `QUERY_TIMEOUT`, `SERVER_BUSY` (pool exhausted), `DATABASE_UNAVAILABLE` |
+| `500` | A bug. Logged with the traceback; the response says nothing about internals | `INTERNAL_ERROR` |
+
+A database constraint firing (which validation should have prevented) is a `409 CONSTRAINT_VIOLATION`. The
+constraint's name and the failing row go to the log, not to the client.
+
+**Pagination.** List endpoints return `{"data": [...], "next_cursor": "..."}`; pass `next_cursor` back as
+`?cursor=` until it is `null`. The cursor is opaque (base64 of the last row's sort key), so the server can change
+what's inside without breaking clients. Every list uses keyset pagination on a unique key: `(created_at, id)` for
+holds and `(posted_at, id)` for transactions, so rows sharing a timestamp are neither skipped nor repeated.
+Statements and the transaction feed read straight from an index, so page 1,000 costs the same as page 1, unlike
+`OFFSET`. Holds are indexed only by account, so each page sorts that account's holds; that's cheap at thousands
+per account, and an `(account_id, created_at, id)` index would fix it if accounts ever have millions.
 
 ## Run it
 
@@ -281,15 +304,16 @@ because a database that already ran a migration never sees later edits to it.
 pytest -q        # starts a throwaway postgres:17 container, or set TALLY_TEST_DATABASE_URL
 ```
 
-119 tests, all against a real PostgreSQL, because the rules under test live in the database:
+141 tests, all against a real PostgreSQL, because the rules under test live in the database:
 
 | Suite | What it covers |
 |---|---|
 | `test_transactions.py` (18) | Deposits, multi-leg fees, per-currency balancing, overdrafts, reversals, statements, point-in-time balances, leg validation, entry-by-entry overdraft checks |
-| `test_holds.py` (11) | Authorize, partial capture, void, expiry, capture on debit-normal accounts, double settlement, capturing the last of the funds, expiry and amount validation |
+| `test_holds.py` (12) | Authorize, partial capture, void, expiry in bounded batches, capture on debit-normal accounts, double settlement, capturing the last of the funds, expiry and amount validation |
 | `test_database_invariants.py` (30) | **Raw SQL that bypasses the app** to try to break each rule, and gets rejected |
 | `test_concurrency.py` (4) | 50 threads draining one account, opposite-direction transfers, one idempotency key from 20 threads, concurrent reversals |
 | `test_api.py` (9) | HTTP contract, idempotent replay, key reuse, problem details, pagination, holds, reconciliation |
+| `test_api_errors.py` (21) | A real row lock becomes `503 LOCK_TIMEOUT`; timeouts, pool exhaustion and outages become 503s; constraint names and crashes don't leak; oversized and chunked bodies get 413; naive timestamps and forged cursors are rejected; paging 120 holds that share one timestamp; optional idempotency; `Location` headers |
 | `test_idempotency.py` (8) | Run once and replay, key reuse, per-operation scope, failed requests not remembered, a retry racing the original, a key purged mid-claim, batched purge |
 | `test_reconciliation.py` (9) | Damages the ledger past every trigger (replica mode) and checks each kind of damage is reported; capped lists with exact totals; one consistent snapshot while transfers commit |
 | `test_migrations.py` (10) | Ordered, idempotent migrations; valid concurrent indexes; the hot queries use them; four instances migrating at once without deadlocking; edited migrations refused |

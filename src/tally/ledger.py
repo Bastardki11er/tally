@@ -38,6 +38,8 @@ ACCOUNT_COLUMNS = (
 )
 TRANSACTION_COLUMNS = "id, description, metadata, reverses_id, posted_at"
 ENTRY_COLUMNS = "id, account_id, direction, amount, currency, balance_after, posted_at"
+EXPIRY_BATCH_SIZE = 500
+
 HOLD_COLUMNS = (
     "id, account_id, amount, status, description, expires_at, captured_transaction_id, created_at, updated_at"
 )
@@ -225,7 +227,7 @@ class Ledger:
             f"UPDATE holds SET status = 'voided' WHERE id = %s RETURNING {HOLD_COLUMNS}", (hold_id,)
         ).fetchone()
 
-    def expire_holds(self, conn: Connection, limit: int = 500) -> int:
+    def expire_holds(self, conn: Connection, limit: int = EXPIRY_BATCH_SIZE) -> int:
         """Releases holds whose expiry has passed. Safe to run on several instances at once."""
         # SKIP LOCKED: holds that a capture or another instance is working on are left alone.
         expired = conn.execute(
@@ -247,12 +249,21 @@ class Ledger:
             raise not_found("HOLD_NOT_FOUND", f"Hold {hold_id} does not exist")
         return hold
 
-    def list_holds(self, conn: Connection, account_id: int, status: str | None = None) -> list[dict]:
+    def list_holds(
+        self,
+        conn: Connection,
+        account_id: int,
+        status: str | None = None,
+        limit: int = 50,
+        before: tuple[datetime, UUID] | None = None,
+    ) -> list[dict]:
+        """An account's holds, newest first. ``before`` is the (created_at, id) of the last hold seen."""
         self.get_account(conn, account_id)
+        after_cursor = "AND (created_at, id) < (%s, %s)" if before else ""
         return conn.execute(
             f"SELECT {HOLD_COLUMNS} FROM holds WHERE account_id = %s AND (%s::text IS NULL OR status = %s) "
-            f"ORDER BY created_at DESC LIMIT 100",
-            (account_id, status, status),
+            f"{after_cursor} ORDER BY created_at DESC, id DESC LIMIT %s",
+            (account_id, status, status, *(before or ()), limit),
         ).fetchall()
 
     # --- history ------------------------------------------------------------------
@@ -269,14 +280,22 @@ class Ledger:
         reversed_by = conn.execute("SELECT id FROM transactions WHERE reverses_id = %s", (transaction_id,)).fetchone()
         return {**transaction, "entries": entries, "reversed_by": reversed_by["id"] if reversed_by else None}
 
-    def recent_transactions(self, conn: Connection, limit: int = 20) -> list[dict]:
-        """The latest transactions with their entries: an activity feed, two queries in total."""
+    def recent_transactions(
+        self, conn: Connection, limit: int = 20, before: tuple[datetime, UUID] | None = None
+    ) -> list[dict]:
+        """The latest transactions with their entries, two queries per page.
+
+        ``before`` is the (posted_at, id) of the last transaction seen. The row comparison
+        walks the (posted_at, id) index backwards from there, however deep the page.
+        """
+        after_cursor = "WHERE (t.posted_at, t.id) < (%s, %s)" if before else ""
         transactions = conn.execute(
             f"""
             SELECT {TRANSACTION_COLUMNS}, (SELECT r.id FROM transactions r WHERE r.reverses_id = t.id) AS reversed_by
-              FROM transactions t ORDER BY posted_at DESC, id DESC LIMIT %s
+              FROM transactions t {after_cursor}
+             ORDER BY t.posted_at DESC, t.id DESC LIMIT %s
             """,
-            (limit,),
+            (*(before or ()), limit),
         ).fetchall()
         entries = conn.execute(
             f"SELECT transaction_id, {ENTRY_COLUMNS} FROM entries WHERE transaction_id = ANY(%s) ORDER BY id",

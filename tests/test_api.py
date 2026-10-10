@@ -118,7 +118,7 @@ def test_general_transactions_reversals_and_statements(client, accounts):
     assert reversal.status_code == 201
     statement = client.get(f"/v1/accounts/{alice['id']}/entries", params={"limit": 2}).json()
     assert [line["description"] for line in statement["data"]] == ["undo", "payment with fee"]
-    assert statement["next_cursor"] == statement["data"][-1]["id"]
+    assert isinstance(statement["next_cursor"], str)  # opaque: clients pass it back, never parse it
     rest = client.get(f"/v1/accounts/{alice['id']}/entries", params={"limit": 2, "cursor": statement["next_cursor"]})
     assert [line["amount"] for line in rest.json()["data"]] == [10_000]
     assert client.get(f"/v1/accounts/{cash['id']}/balance").json()["balance"] == 10_000

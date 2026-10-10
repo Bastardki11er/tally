@@ -2,13 +2,30 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from typing import Annotated, Any, Generic, Literal, TypeVar
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import AfterValidator, BaseModel, Field
 
 T = TypeVar("T")
+
+# The database's CHECK allows 4096 bytes of jsonb text; staying a little under it means
+# small formatting differences (jsonb renders numbers its own way) can't push a value
+# that passed here over the database limit.
+MAX_METADATA_BYTES = 4000
+
+
+def _small_enough(metadata: dict[str, Any]) -> dict[str, Any]:
+    # Measured like jsonb::text: ", " and ": " separators, UTF-8 bytes.
+    size = len(json.dumps(metadata, ensure_ascii=False).encode())
+    if size > MAX_METADATA_BYTES:
+        raise ValueError(f"metadata is {size} bytes as JSON; the limit is {MAX_METADATA_BYTES}")
+    return metadata
+
+
+Metadata = Annotated[dict[str, Any], AfterValidator(_small_enough)]
 
 # Money is always an integer number of minor units (cents for USD), never a float.
 Amount = Annotated[int, Field(gt=0, le=10**15, description="Minor units, e.g. 1050 = $10.50")]
@@ -22,7 +39,7 @@ class AccountIn(BaseModel):
     type: Literal["asset", "liability", "equity", "revenue", "expense"]
     currency: Annotated[str, Field(pattern=r"^[A-Z]{3}$", examples=["USD"])]
     allow_negative: bool = Field(False, description="Whether the balance may go below zero")
-    metadata: dict[str, Any] = Field(default_factory=dict)
+    metadata: Metadata = Field(default_factory=dict)
 
 
 class AccountOut(BaseModel):
@@ -58,7 +75,7 @@ class EntryOut(BaseModel):
 class TransactionIn(BaseModel):
     entries: Annotated[list[EntryIn], Field(min_length=2, max_length=100)]
     description: Description = ""
-    metadata: dict[str, Any] = Field(default_factory=dict)
+    metadata: Metadata = Field(default_factory=dict)
 
 
 class TransferIn(BaseModel):
@@ -66,7 +83,7 @@ class TransferIn(BaseModel):
     credit_account_id: AccountId
     amount: Amount
     description: Description = ""
-    metadata: dict[str, Any] = Field(default_factory=dict)
+    metadata: Metadata = Field(default_factory=dict)
 
 
 class TransactionOut(BaseModel):
@@ -132,4 +149,17 @@ class BalanceOut(BaseModel):
 
 class Page(BaseModel, Generic[T]):
     data: list[T]
-    next_cursor: int | None = Field(None, description="Pass back as the cursor to get the next page")
+    next_cursor: str | None = Field(
+        None, description="Opaque; pass it back as ?cursor= to get the next page. Null on the last page."
+    )
+
+
+class Problem(BaseModel):
+    """An error, as RFC 9457 problem details. Branch on ``code``; ``detail`` is meant for people."""
+
+    type: str = "about:blank"
+    title: str
+    status: int
+    detail: str
+    code: str = Field(examples=["INSUFFICIENT_FUNDS"])
+    errors: list[dict[str, Any]] | None = Field(None, description="Per-field problems, for VALIDATION_ERROR")
