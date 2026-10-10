@@ -79,7 +79,8 @@ def _maintenance_loop(db: Database, ledger: Ledger, interval: float, stop: threa
         try:
             while db.run(lambda conn: ledger.expire_holds(conn)) == 500:
                 pass  # a full batch: there may be more
-            db.run(idempotency.purge_expired)
+            while db.run(idempotency.purge_expired) == idempotency.PURGE_BATCH_SIZE:
+                pass
         except Exception:  # keep the loop alive; the next tick retries
             log.exception("maintenance run failed")
 
