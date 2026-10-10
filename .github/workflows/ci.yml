@@ -25,7 +25,7 @@ jobs:
       matrix:
         python: ["3.11", "3.13"] # the oldest version pyproject.toml promises, and the one the image runs
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python }}
@@ -47,7 +47,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Start the stack and wait until the app's health check passes
         run: docker compose up -d --build --wait
       - name: Concurrent transfers (fails on any 5xx, timeout or unbalanced books)
