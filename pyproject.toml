@@ -18,7 +18,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "hypothesis>=6.100", "httpx2>=2.0", "ruff>=0.6", "testcontainers[postgres]>=4.8"]
+dev = ["pytest>=8", "pytest-cov>=6", "hypothesis>=6.100", "httpx2>=2.0", "ruff>=0.6", "testcontainers[postgres]>=4.8"]
 
 [project.scripts]
 tally = "tally.cli:main"
@@ -31,6 +31,20 @@ packages = ["src/tally"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = ["--strict-markers", "--strict-config"]
+xfail_strict = true
+# A warning today is a failure after the next upgrade: fail now, while the cause is fresh.
+# This also turns an exception escaping a background thread into a test failure.
+filterwarnings = ["error"]
+
+[tool.coverage.run]
+source = ["tally"]
+branch = true
+
+[tool.coverage.report]
+fail_under = 90
+show_missing = true
+skip_covered = true
 
 [tool.ruff]
 line-length = 120

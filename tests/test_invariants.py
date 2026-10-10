@@ -179,8 +179,7 @@ def ledger_machine(db):
 def test_random_operation_sequences_keep_the_books_correct(db):
     run_state_machine_as_test(
         ledger_machine(db),
-        settings=settings(
-            max_examples=40,
+        settings=settings(  # max_examples comes from the profile (see conftest.py)
             stateful_step_count=30,
             deadline=None,
             suppress_health_check=[HealthCheck.too_slow, HealthCheck.function_scoped_fixture],

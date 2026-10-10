@@ -1,3 +1,4 @@
+import uuid
 from datetime import UTC, datetime
 
 import pytest
@@ -207,3 +208,30 @@ def test_a_transaction_is_applied_and_checked_entry_by_entry(books, wallet):
 
     assert error.value.code == "INSUFFICIENT_FUNDS"
     assert balance(books, alice) == 50
+
+
+def test_a_single_entry_is_refused_before_anything_is_written(books, wallet, db):
+    alice = wallet("alice", funded=100)
+
+    with pytest.raises(LedgerError) as error:
+        books.post([Leg(alice["id"], "debit", 50)])
+
+    assert (error.value.status, error.value.code) == (422, "TOO_FEW_ENTRIES")
+    assert db.run(lambda conn: conn.execute("SELECT count(*) AS n FROM transactions").fetchone()["n"]) == 1
+
+
+@pytest.mark.parametrize(
+    ("operation", "code"),
+    [
+        (lambda books, missing: books.get_transaction(missing), "TRANSACTION_NOT_FOUND"),
+        (lambda books, missing: books.reverse(missing), "TRANSACTION_NOT_FOUND"),
+        (lambda books, missing: books.get_hold(missing), "HOLD_NOT_FOUND"),
+        (lambda books, missing: books.capture_hold(missing, 1), "HOLD_NOT_FOUND"),
+        (lambda books, missing: books.void_hold(missing), "HOLD_NOT_FOUND"),
+    ],
+)
+def test_unknown_ids_are_404s(books, operation, code):
+    with pytest.raises(LedgerError) as error:
+        operation(books, uuid.uuid4())
+
+    assert (error.value.status, error.value.code) == (404, code)

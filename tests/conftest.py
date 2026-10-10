@@ -8,11 +8,19 @@ import os
 
 import psycopg
 import pytest
+from hypothesis import settings
 
 from tally.db import Database, migrate
 from tally.ledger import Ledger
 
 TABLES = "accounts, transactions, entries, holds, idempotency_keys"
+
+# Pull requests run 40 random operation sequences; `pytest --hypothesis-profile=thorough`
+# runs 500. print_blob makes a failure in CI print a @reproduce_failure line that
+# replays the exact sequence locally.
+settings.register_profile("ci", max_examples=40, print_blob=True)
+settings.register_profile("thorough", max_examples=500, print_blob=True)
+settings.load_profile("ci")
 
 
 @pytest.fixture(scope="session")

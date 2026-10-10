@@ -163,3 +163,14 @@ def test_capture_amounts_and_currencies_are_checked(books, wallet):
     assert zero.value.code == "INVALID_AMOUNT"
     assert other_currency.value.code == "CURRENCY_MISMATCH"
     assert books.get_hold(hold["id"])["status"] == "active"  # nothing was written
+
+
+def test_a_hold_cannot_be_captured_into_the_account_it_holds(books, wallet):
+    alice = wallet("alice", funded=1_000)
+    hold = books.create_hold(alice["id"], 400, datetime.now(UTC) + LATER)
+
+    with pytest.raises(LedgerError) as error:
+        books.capture_hold(hold["id"], alice["id"])
+
+    assert error.value.code == "SAME_ACCOUNT"
+    assert books.get_hold(hold["id"])["status"] == "active"  # nothing changed
