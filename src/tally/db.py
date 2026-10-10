@@ -37,6 +37,7 @@ class Database:
         statement_timeout_ms: int = 30_000,
         idle_in_transaction_timeout_ms: int = 60_000,
         check_idle_after_seconds: float = 1.0,
+        pool_timeout_seconds: float = 10.0,
     ) -> None:
         # Server-side limits on every pooled connection. Without them, a transaction
         # stuck behind a row lock (an open psql session, a hung client) waits forever
@@ -53,6 +54,10 @@ class Database:
             max_size=max_size,
             kwargs={"row_factory": dict_row, "options": limits},
             check=self._check_if_idle,
+            # How long a request waits for a free connection before PoolTimeout (the API
+            # answers 503). psycopg_pool's default of 30 s would let an overloaded
+            # service pile up requests for half a minute each.
+            timeout=pool_timeout_seconds,
             open=True,
         )
 

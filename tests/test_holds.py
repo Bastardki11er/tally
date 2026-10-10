@@ -111,6 +111,19 @@ def test_expired_holds_cannot_be_captured_and_are_released_by_the_expiry_job(boo
     assert account(books, alice)["held"] == 200
 
 
+def test_the_expiry_job_works_in_bounded_batches(books, db, wallet):
+    # One huge UPDATE after a backlog would hold every affected account's lock at once.
+    alice = wallet("alice", funded=1_000)
+    for _ in range(5):
+        books.create_hold(alice["id"], 10, datetime.now(UTC) + LATER)
+    db.run(lambda conn: conn.execute("UPDATE holds SET expires_at = now() - interval '1 second'"))
+
+    batches = [books.expire_holds(limit=2) for _ in range(4)]
+
+    assert batches == [2, 2, 1, 0]
+    assert account(books, alice)["held"] == 0
+
+
 def test_capturing_a_hold_on_the_last_of_the_funds_works(books, wallet):
     # Available is 0 while the hold exists. The capture must release the reservation
     # before the debit lands, or the database's overdraft check would refuse it.
