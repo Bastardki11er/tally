@@ -229,13 +229,32 @@ tally migrate && tally demo && tally serve
 tally reconcile                        # exit code 1 if anything disagrees
 ```
 
+| Variable | Default | |
+|---|---|---|
+| `TALLY_DATABASE_URL` | `postgresql://tally:tally@localhost:5432/tally` | Never printed: `Settings` redacts the password in logs and tracebacks |
+| `TALLY_POOL_SIZE` | `20` | Connections per worker process |
+| `TALLY_LOCK_TIMEOUT_MS` | `5000` | Give up waiting for a row lock (Postgres `lock_timeout`) |
+| `TALLY_STATEMENT_TIMEOUT_MS` | `30000` | Cancel any statement that runs longer (`statement_timeout`) |
+| `TALLY_MAINTENANCE_INTERVAL` | `5` | Seconds between hold-expiry / idempotency-cleanup runs |
+
+### Connection handling
+
+Every pooled connection gets `lock_timeout`, `statement_timeout` and `idle_in_transaction_session_timeout`.
+Without them, one transaction stuck behind a row lock (an engineer's open psql session, a hung client) waits
+forever while holding a pool connection, and enough of those drain the pool. Connections are pinged before
+use only if they sat idle for over a second, the trick HikariCP uses. Pinging on every checkout cost about 9%
+of transfer throughput in the load test (3,130–3,160 → 2,820–2,880 transfers/s). Skipping recently used
+connections brought it back, and still catches connections killed by idle timeouts or a database restart.
+The migration runner stores a checksum of each applied file and refuses to start if one was edited afterwards,
+because a database that already ran a migration never sees later edits to it.
+
 ## Tests
 
 ```bash
 pytest -q        # starts a throwaway postgres:17 container, or set TALLY_TEST_DATABASE_URL
 ```
 
-64 tests, all against a real PostgreSQL, because the rules under test live in the database:
+87 tests, all against a real PostgreSQL, because the rules under test live in the database:
 
 | Suite | What it covers |
 |---|---|
@@ -244,7 +263,8 @@ pytest -q        # starts a throwaway postgres:17 container, or set TALLY_TEST_D
 | `test_database_invariants.py` (25) | **Raw SQL that bypasses the app** to try to break each rule, and gets rejected |
 | `test_concurrency.py` (4) | 50 threads draining one account, opposite-direction transfers, one idempotency key from 20 threads, concurrent reversals |
 | `test_api.py` (9) | HTTP contract, idempotent replay, key reuse, problem details, pagination, holds, reconciliation |
-| `test_migrations.py` (6) | Ordered, idempotent migrations; valid concurrent indexes; the hot queries use them; four instances migrating at once without deadlocking |
+| `test_migrations.py` (10) | Ordered, idempotent migrations; valid concurrent indexes; the hot queries use them; four instances migrating at once without deadlocking; edited migrations refused |
+| `test_db.py` (8), `test_config.py` (11) | Commit/rollback, deadlock retries in fresh transactions, lock timeouts, replacing dropped connections, idle-only pings; config parsing, validation and password redaction |
 | `test_invariants.py` | **Model-based testing**: Hypothesis generates 40 random sequences of up to 30 operations (deposits, transfers, holds, captures, voids, reversals). After *every* step it checks that reconciliation is clean, the database matches an in-memory model balance for balance, and no protected account is overdrawn |
 
 To check that the model-based test has teeth, I planted a bug: a partial capture that releases only the
@@ -264,7 +284,7 @@ src/tally/
 ├── ledger.py               posting, transfers, holds, reversals, statements (ordered row locks)
 ├── idempotency.py          idempotency keys in the same transaction as the operation
 ├── reconciliation.py       re-derives all balances in a REPEATABLE READ snapshot
-├── db.py                   connection pool, deadlock retry, advisory-locked migration runner
+├── db.py                   connection pool with timeouts and idle checks, deadlock retry, migration runner
 ├── api.py, schemas.py      FastAPI routes, Pydantic models, RFC 9457 errors
 ├── cli.py                  tally migrate | serve | reconcile | demo
 └── static/                 the console (plain JS, no build step)
