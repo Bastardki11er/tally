@@ -67,8 +67,19 @@ def test_each_currency_must_balance_on_its_own(books, wallet):
     )
     # Nets to zero overall, but USD and EUR each don't balance: rejected.
     with pytest.raises(LedgerError) as error:
-        books.post([Leg(usd_a["id"], "debit", 100), Leg(eur_b["id"], "credit", 100)])
+        books.post(
+            [
+                Leg(usd_a["id"], "debit", 100),
+                Leg(usd_b["id"], "credit", 50),
+                Leg(eur_a["id"], "debit", 50),
+                Leg(eur_b["id"], "credit", 100),
+            ]
+        )
     assert error.value.code == "UNBALANCED"
+    # A plain two-account transfer across currencies gets a clearer error.
+    with pytest.raises(LedgerError) as mismatch:
+        books.transfer(usd_a["id"], eur_b["id"], 100)
+    assert mismatch.value.code == "CURRENCY_MISMATCH"
 
 
 def test_overdrafts_are_refused(books, wallet):
@@ -165,3 +176,34 @@ def test_balance_as_of_a_past_moment(books, db, wallet):
     assert books.balance_at(alice["id"], between) == 1_000
     assert books.balance_at(alice["id"], datetime.now(UTC)) == 600
     assert books.balance_at(alice["id"], datetime(2000, 1, 1, tzinfo=UTC)) == 0
+
+
+@pytest.mark.parametrize(
+    ("direction", "amount", "code"),
+    [
+        ("debit", 0, "INVALID_AMOUNT"),
+        ("debit", -5, "INVALID_AMOUNT"),
+        ("debit", 1.5, "INVALID_AMOUNT"),
+        ("debit", True, "INVALID_AMOUNT"),  # bool is an int in Python; True is not 1 cent
+        ("DEBIT", 100, "INVALID_ENTRY"),
+    ],
+)
+def test_legs_are_validated_before_anything_is_written(direction, amount, code):
+    with pytest.raises(LedgerError) as error:
+        Leg(1, direction, amount)
+
+    assert error.value.code == code
+
+
+def test_a_transaction_is_applied_and_checked_entry_by_entry(books, wallet):
+    # The database applies entries one at a time, so a protected account may not dip
+    # below zero even briefly. Credit first and the same entries are fine.
+    alice, bob = wallet("alice", funded=100), wallet("bob")
+    legs = [Leg(alice["id"], "debit", 150), Leg(alice["id"], "credit", 100), Leg(bob["id"], "credit", 50)]
+
+    with pytest.raises(LedgerError) as error:
+        books.post(legs)
+    books.post([legs[1], legs[0], legs[2]])
+
+    assert error.value.code == "INSUFFICIENT_FUNDS"
+    assert balance(books, alice) == 50

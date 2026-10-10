@@ -89,10 +89,16 @@ def test_holds_can_only_be_settled_once_and_not_beyond_their_amount(books, walle
     assert again.value.code == void_after.value.code == "HOLD_NOT_ACTIVE"
 
 
-def test_expired_holds_cannot_be_captured_and_are_released_by_the_expiry_job(books, wallet):
+def test_expired_holds_cannot_be_captured_and_are_released_by_the_expiry_job(books, db, wallet):
     alice, store = wallet("alice", funded=1_000), wallet("store")
-    stale = books.create_hold(alice["id"], 300, datetime.now(UTC) - timedelta(seconds=1))
+    stale = books.create_hold(alice["id"], 300, datetime.now(UTC) + LATER)
     fresh = books.create_hold(alice["id"], 200, datetime.now(UTC) + LATER)
+    # Let one run out, as if a day had passed.
+    db.run(
+        lambda conn: conn.execute(
+            "UPDATE holds SET expires_at = now() - interval '1 second' WHERE id = %s", (stale["id"],)
+        )
+    )
 
     with pytest.raises(LedgerError) as error:
         books.capture_hold(stale["id"], store["id"])
@@ -103,3 +109,44 @@ def test_expired_holds_cannot_be_captured_and_are_released_by_the_expiry_job(boo
     assert books.get_hold(stale["id"])["status"] == "expired"
     assert books.get_hold(fresh["id"])["status"] == "active"
     assert account(books, alice)["held"] == 200
+
+
+def test_capturing_a_hold_on_the_last_of_the_funds_works(books, wallet):
+    # Available is 0 while the hold exists. The capture must release the reservation
+    # before the debit lands, or the database's overdraft check would refuse it.
+    alice, store = wallet("alice", funded=400), wallet("store")
+    hold = books.create_hold(alice["id"], 400, datetime.now(UTC) + LATER)
+
+    books.capture_hold(hold["id"], store["id"])
+
+    a = account(books, alice)
+    assert (a["balance"], a["held"], a["available"]) == (0, 0, 0)
+
+
+@pytest.mark.parametrize(
+    "expires_at",
+    [datetime.now() + LATER, datetime.now(UTC) - timedelta(seconds=1)],
+    ids=["naive", "in-the-past"],
+)
+def test_a_hold_needs_an_aware_future_expiry(books, wallet, expires_at):
+    alice = wallet("alice", funded=1_000)
+
+    with pytest.raises(LedgerError) as error:
+        books.create_hold(alice["id"], 100, expires_at)
+
+    assert error.value.code == "INVALID_EXPIRY"
+
+
+def test_capture_amounts_and_currencies_are_checked(books, wallet):
+    alice, store = wallet("alice", funded=1_000), wallet("store")
+    euros = books.create_account("EUR merchant", "liability", "EUR")
+    hold = books.create_hold(alice["id"], 400, datetime.now(UTC) + LATER)
+
+    with pytest.raises(LedgerError) as zero:
+        books.capture_hold(hold["id"], store["id"], 0)
+    with pytest.raises(LedgerError) as other_currency:
+        books.capture_hold(hold["id"], euros["id"])
+
+    assert zero.value.code == "INVALID_AMOUNT"
+    assert other_currency.value.code == "CURRENCY_MISMATCH"
+    assert books.get_hold(hold["id"])["status"] == "active"  # nothing was written

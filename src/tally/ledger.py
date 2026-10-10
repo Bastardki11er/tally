@@ -4,17 +4,23 @@ Every method takes an open connection and runs inside the caller's database
 transaction, so the API layer can combine an operation with its idempotency
 record atomically.
 
+Who writes what: this module inserts transactions, entries and holds, and changes
+hold statuses. The database derives everything else (migration 005): inserting an
+entry moves the account's balance and fills in balance_after, and creating or
+settling a hold moves the account's held amount. The checks here exist to fail
+early with a precise error; the database enforces the same rules regardless.
+
 Concurrency: every operation locks the account rows it touches with
 ``SELECT ... FOR UPDATE``, always in ascending id order. Two transfers between
 the same accounts in opposite directions therefore queue up instead of
-deadlocking, and balances are read and written under the same lock, so no
+deadlocking, and a balance is checked and changed under the same lock, so no
 update is ever lost.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any, Literal
 from uuid import UUID
 
@@ -37,6 +43,12 @@ HOLD_COLUMNS = (
 )
 
 
+def require_positive_amount(amount: object, what: str = "amount") -> None:
+    # bool is a subclass of int in Python: True would otherwise pass as 1.
+    if isinstance(amount, bool) or not isinstance(amount, int) or amount <= 0:
+        raise unprocessable("INVALID_AMOUNT", f"{what} must be a positive whole number of minor units, got {amount!r}")
+
+
 @dataclass(frozen=True)
 class Leg:
     """One side of a transaction: move ``amount`` minor units on ``account_id``."""
@@ -44,6 +56,12 @@ class Leg:
     account_id: int
     direction: Direction
     amount: int
+
+    def __post_init__(self) -> None:
+        # Fail here with a clear error rather than later on a database CHECK.
+        if self.direction not in ("debit", "credit"):
+            raise unprocessable("INVALID_ENTRY", f"direction must be 'debit' or 'credit', got {self.direction!r}")
+        require_positive_amount(self.amount)
 
 
 def opposite(direction: str) -> Direction:
@@ -90,63 +108,11 @@ class Ledger:
         metadata: dict | None = None,
         reverses_id: UUID | None = None,
     ) -> dict:
-        """Posts a balanced transaction and updates every affected balance."""
-        if len(legs) < 2:
-            raise unprocessable("TOO_FEW_ENTRIES", "A transaction needs at least two entries")
+        """Posts a balanced transaction; the database applies each entry to its account's balance."""
         accounts = self._lock_accounts(conn, {leg.account_id for leg in legs})
-
-        net: dict[str, int] = {}
-        for leg in legs:
-            currency = accounts[leg.account_id]["currency"]
-            net[currency] = net.get(currency, 0) + (leg.amount if leg.direction == "debit" else -leg.amount)
-        unbalanced = {currency: amount for currency, amount in net.items() if amount != 0}
-        if unbalanced:
-            detail = ", ".join(f"{c} debits - credits = {n}" for c, n in unbalanced.items())
-            raise unprocessable("UNBALANCED", f"Debits must equal credits in every currency ({detail})")
-
-        # Apply the legs in order, recording each account's running balance.
-        balances = {account_id: account["balance"] for account_id, account in accounts.items()}
-        balance_after: list[int] = []
-        for leg in legs:
-            account = accounts[leg.account_id]
-            balances[leg.account_id] += leg.amount if leg.direction == account["normal_side"] else -leg.amount
-            balance_after.append(balances[leg.account_id])
-
-        for account_id, balance in balances.items():
-            account = accounts[account_id]
-            if not account["allow_negative"] and balance - account["held"] < 0:
-                raise conflict(
-                    "INSUFFICIENT_FUNDS",
-                    f"Account {account_id} has {account['available']} available, "
-                    f"this transaction needs {account['balance'] - balance}",
-                )
-
-        transaction = conn.execute(
-            f"INSERT INTO transactions (description, metadata, reverses_id) VALUES (%s, %s, %s) "
-            f"RETURNING {TRANSACTION_COLUMNS}",
-            (description, Jsonb(metadata or {}), reverses_id),
-        ).fetchone()
-        entries = conn.execute(
-            f"""
-            INSERT INTO entries (transaction_id, account_id, direction, amount, currency, balance_after)
-            SELECT %s, * FROM unnest(%s::bigint[], %s::text[], %s::bigint[], %s::char(3)[], %s::bigint[])
-            RETURNING {ENTRY_COLUMNS}
-            """,
-            (
-                transaction["id"],
-                [leg.account_id for leg in legs],
-                [leg.direction for leg in legs],
-                [leg.amount for leg in legs],
-                [accounts[leg.account_id]["currency"] for leg in legs],
-                balance_after,
-            ),
-        ).fetchall()
-        conn.execute(
-            "UPDATE accounts AS a SET balance = v.balance "
-            "FROM unnest(%s::bigint[], %s::bigint[]) AS v (id, balance) WHERE a.id = v.id",
-            (list(balances), list(balances.values())),
-        )
-        return {**transaction, "entries": sorted(entries, key=lambda e: e["id"])}
+        self._check_postable(accounts, legs)
+        transaction = self._insert_transaction(conn, description, metadata, reverses_id)
+        return self._insert_entries(conn, transaction, accounts, legs)
 
     def transfer(
         self,
@@ -195,18 +161,24 @@ class Ledger:
         self, conn: Connection, account_id: int, amount: int, expires_at: datetime, description: str = ""
     ) -> dict:
         """Reserves funds for a later capture: they stay in the balance but are no longer available."""
+        require_positive_amount(amount)
+        # A naive datetime would be read in the database session's time zone, which can
+        # shift the expiry by hours without any error.
+        if expires_at.tzinfo is None:
+            raise unprocessable("INVALID_EXPIRY", "expires_at must include a time zone")
+        if expires_at <= datetime.now(UTC):
+            raise unprocessable("INVALID_EXPIRY", f"expires_at must be in the future, got {expires_at.isoformat()}")
         account = self._lock_accounts(conn, {account_id})[account_id]
         if not account["allow_negative"] and account["available"] < amount:
             raise conflict(
                 "INSUFFICIENT_FUNDS", f"Account {account_id} has {account['available']} available, hold needs {amount}"
             )
-        hold = conn.execute(
+        # The database adds an active hold to the account's held amount.
+        return conn.execute(
             f"INSERT INTO holds (account_id, amount, expires_at, description) VALUES (%s, %s, %s, %s) "
             f"RETURNING {HOLD_COLUMNS}",
             (account_id, amount, expires_at, description),
         ).fetchone()
-        conn.execute("UPDATE accounts SET held = held + %s WHERE id = %s", (amount, account_id))
-        return hold
 
     def capture_hold(
         self,
@@ -219,57 +191,54 @@ class Ledger:
         """Turns a hold into a real transaction. Any uncaptured remainder is released."""
         hold = self._lock_active_hold(conn, hold_id)
         amount = hold["amount"] if amount is None else amount
+        require_positive_amount(amount, "capture amount")
         if amount > hold["amount"]:
             raise unprocessable("CAPTURE_EXCEEDS_HOLD", f"Cannot capture {amount}, the hold is for {hold['amount']}")
         if destination_account_id == hold["account_id"]:
             raise unprocessable("SAME_ACCOUNT", "Destination must differ from the held account")
 
         accounts = self._lock_accounts(conn, {hold["account_id"], destination_account_id})
-        # Release the reservation first, so the spend below is checked against real
-        # funds rather than counting the held amount twice.
-        conn.execute("UPDATE accounts SET held = held - %s WHERE id = %s", (hold["amount"], hold["account_id"]))
+        source = accounts[hold["account_id"]]
         # Spending moves the held account away from its normal side, whatever its type.
-        out = opposite(accounts[hold["account_id"]]["normal_side"])
+        out = opposite(source["normal_side"])
         legs = [Leg(hold["account_id"], out, amount), Leg(destination_account_id, opposite(out), amount)]
-        transaction = self.post(conn, legs, description or hold["description"], {"hold_id": str(hold_id)})
+        # Check against the funds as they will be once this hold's reservation is
+        # released; counting the reserved amount as unavailable would count it twice.
+        released = {**accounts, source["id"]: {**source, "held": source["held"] - hold["amount"]}}
+        self._check_postable(released, legs)
+
+        transaction = self._insert_transaction(conn, description or hold["description"], {"hold_id": str(hold_id)})
+        # Marking the hold captured releases its reservation (database trigger), so it
+        # happens before the entries move the balance.
         captured = conn.execute(
-            f"UPDATE holds SET status = 'captured', captured_transaction_id = %s, updated_at = now() "
+            f"UPDATE holds SET status = 'captured', captured_transaction_id = %s "
             f"WHERE id = %s RETURNING {HOLD_COLUMNS}",
             (transaction["id"], hold_id),
         ).fetchone()
+        transaction = self._insert_entries(conn, transaction, accounts, legs)
         return {"hold": captured, "transaction": transaction}
 
     def void_hold(self, conn: Connection, hold_id: UUID) -> dict:
-        hold = self._lock_active_hold(conn, hold_id)
-        self._lock_accounts(conn, {hold["account_id"]})
-        conn.execute("UPDATE accounts SET held = held - %s WHERE id = %s", (hold["amount"], hold["account_id"]))
+        self._lock_active_hold(conn, hold_id)
+        # The database gives the amount back to the account's available funds.
         return conn.execute(
-            f"UPDATE holds SET status = 'voided', updated_at = now() WHERE id = %s RETURNING {HOLD_COLUMNS}",
-            (hold_id,),
+            f"UPDATE holds SET status = 'voided' WHERE id = %s RETURNING {HOLD_COLUMNS}", (hold_id,)
         ).fetchone()
 
     def expire_holds(self, conn: Connection, limit: int = 500) -> int:
         """Releases holds whose expiry has passed. Safe to run on several instances at once."""
         # SKIP LOCKED: holds that a capture or another instance is working on are left alone.
         expired = conn.execute(
-            "SELECT id, account_id, amount FROM holds WHERE status = 'active' AND expires_at <= now() "
+            "SELECT id, account_id FROM holds WHERE status = 'active' AND expires_at <= now() "
             "ORDER BY expires_at LIMIT %s FOR UPDATE SKIP LOCKED",
             (limit,),
         ).fetchall()
         if not expired:
             return 0
-        totals: dict[int, int] = {}
-        for hold in expired:
-            totals[hold["account_id"]] = totals.get(hold["account_id"], 0) + hold["amount"]
-        self._lock_accounts(conn, set(totals))
-        conn.execute(
-            "UPDATE holds SET status = 'expired', updated_at = now() WHERE id = ANY(%s)", ([h["id"] for h in expired],)
-        )
-        conn.execute(
-            "UPDATE accounts AS a SET held = a.held - v.total "
-            "FROM unnest(%s::bigint[], %s::bigint[]) AS v (id, total) WHERE a.id = v.id",
-            (list(totals), list(totals.values())),
-        )
+        # The trigger releasing each hold updates its account. Take those row locks first,
+        # in id order like every other path, rather than in whatever order holds expire.
+        self._lock_accounts(conn, {hold["account_id"] for hold in expired})
+        conn.execute("UPDATE holds SET status = 'expired' WHERE id = ANY(%s)", ([h["id"] for h in expired],))
         return len(expired)
 
     def get_hold(self, conn: Connection, hold_id: UUID) -> dict:
@@ -340,9 +309,9 @@ class Ledger:
     def balance_at(self, conn: Connection, account_id: int, as_of: datetime) -> int:
         """The account's posted balance at a moment in the past, read from the running balance."""
         self.get_account(conn, account_id)
-        # Within one account posted_at rises with id (it is taken under the row lock),
-        # so this is "the latest entry at or before as_of", answered by one probe of
-        # the (account_id, posted_at, id) index however far back as_of is.
+        # Within one account posted_at rises with id (migration 003 guarantees it), so
+        # this is "the latest entry at or before as_of", answered by one probe of the
+        # (account_id, posted_at, id) index however far back as_of is.
         row = conn.execute(
             "SELECT balance_after FROM entries WHERE account_id = %s AND posted_at <= %s "
             "ORDER BY posted_at DESC, id DESC LIMIT 1",
@@ -350,7 +319,71 @@ class Ledger:
         ).fetchone()
         return row["balance_after"] if row else 0
 
-    # --- locking ------------------------------------------------------------------
+    # --- internals ----------------------------------------------------------------
+
+    def _check_postable(self, accounts: dict[int, dict[str, Any]], legs: list[Leg]) -> None:
+        """Validates legs against the locked accounts before anything is written."""
+        if len(legs) < 2:
+            raise unprocessable("TOO_FEW_ENTRIES", "A transaction needs at least two entries")
+        currencies = [accounts[leg.account_id]["currency"] for leg in legs]
+        if len(legs) == 2 and currencies[0] != currencies[1]:
+            raise unprocessable(
+                "CURRENCY_MISMATCH", f"Cannot move money between {currencies[0]} and {currencies[1]} accounts"
+            )
+
+        net: dict[str, int] = {}
+        for leg, currency in zip(legs, currencies, strict=True):
+            net[currency] = net.get(currency, 0) + (leg.amount if leg.direction == "debit" else -leg.amount)
+        unbalanced = {currency: amount for currency, amount in net.items() if amount != 0}
+        if unbalanced:
+            detail = ", ".join(f"{c} debits - credits = {n}" for c, n in unbalanced.items())
+            raise unprocessable("UNBALANCED", f"Debits must equal credits in every currency ({detail})")
+
+        # Walk the legs the way the database will apply them, one entry at a time: a
+        # protected account may not dip below zero at any step, not just at the end.
+        balances = {account_id: account["balance"] for account_id, account in accounts.items()}
+        for leg in legs:
+            account = accounts[leg.account_id]
+            balances[leg.account_id] += leg.amount if leg.direction == account["normal_side"] else -leg.amount
+            if not account["allow_negative"] and balances[leg.account_id] - account["held"] < 0:
+                raise conflict(
+                    "INSUFFICIENT_FUNDS",
+                    f"Account {leg.account_id} has {account['balance'] - account['held']} available, "
+                    f"this transaction needs {account['balance'] - balances[leg.account_id]}",
+                )
+
+    def _insert_transaction(
+        self, conn: Connection, description: str, metadata: dict | None, reverses_id: UUID | None = None
+    ) -> dict:
+        return conn.execute(
+            f"INSERT INTO transactions (description, metadata, reverses_id) VALUES (%s, %s, %s) "
+            f"RETURNING {TRANSACTION_COLUMNS}",
+            (description, Jsonb(metadata or {}), reverses_id),
+        ).fetchone()
+
+    def _insert_entries(
+        self, conn: Connection, transaction: dict, accounts: dict[int, dict[str, Any]], legs: list[Leg]
+    ) -> dict:
+        # WITH ORDINALITY ... ORDER BY n: entries go in, and hit the balance trigger, in
+        # exactly the order of the legs.
+        entries = conn.execute(
+            f"""
+            INSERT INTO entries (transaction_id, account_id, direction, amount, currency)
+            SELECT %s, account_id, direction, amount, currency
+              FROM unnest(%s::bigint[], %s::text[], %s::bigint[], %s::char(3)[])
+                   WITH ORDINALITY AS leg (account_id, direction, amount, currency, n)
+             ORDER BY n
+            RETURNING {ENTRY_COLUMNS}
+            """,
+            (
+                transaction["id"],
+                [leg.account_id for leg in legs],
+                [leg.direction for leg in legs],
+                [leg.amount for leg in legs],
+                [accounts[leg.account_id]["currency"] for leg in legs],
+            ),
+        ).fetchall()
+        return {**transaction, "entries": sorted(entries, key=lambda e: e["id"])}
 
     def _lock_accounts(self, conn: Connection, account_ids: set[int]) -> dict[int, dict[str, Any]]:
         # ORDER BY id + FOR UPDATE takes the row locks in ascending id order, the same
