@@ -264,6 +264,15 @@ def test_the_openapi_document_describes_the_error_shape(client):
     assert "default" in spec["paths"]["/v1/transfers"]["post"]["responses"]
 
 
+def test_every_framework_status_has_a_fixed_code():
+    # Codes are part of the API contract. Deriving them from HTTPStatus names made 413
+    # read CONTENT_TOO_LARGE on Python 3.13 but REQUEST_ENTITY_TOO_LARGE on 3.11.
+    from tally.api import FRAMEWORK_CODES
+
+    assert FRAMEWORK_CODES[413] == "CONTENT_TOO_LARGE"
+    assert all(code.isupper() and " " not in code for code in FRAMEWORK_CODES.values())
+
+
 def test_framework_errors_are_problem_documents_too(client):
     assert_problem(client.get("/v1/no-such-thing"), 404, "NOT_FOUND")
     wrong_method = client.delete("/v1/accounts")
