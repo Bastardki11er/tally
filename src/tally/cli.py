@@ -153,7 +153,7 @@ def demo_command(args: argparse.Namespace, settings: Settings) -> int:
         if conn.execute("SELECT EXISTS (SELECT 1 FROM accounts) AS used").fetchone()["used"]:
             raise CommandError("the ledger already has accounts; demo data only goes into an empty database")
         seed_demo(conn)
-    print("demo data created; open the console at http://localhost:8000/")
+    print("demo data created; the console is at / on the API server (http://localhost:8000/ by default)")
     return EXIT_OK
 
 

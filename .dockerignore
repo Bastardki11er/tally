@@ -1,0 +1,16 @@
+# Only src/, migrations/, pyproject.toml, README.md and requirements.txt go into the image.
+.git
+.github
+.venv
+**/__pycache__
+.pytest_cache
+.ruff_cache
+.hypothesis
+.coverage
+htmlcov
+*.egg-info
+dist
+build
+docs
+scripts
+tests

@@ -196,8 +196,11 @@ connection default is sized for requests. On 2M entries it takes about 3.5 s.
 ## Load test
 
 [`scripts/load_test.py`](scripts/load_test.py) funds 200 wallets, fires 10,000 concurrent transfers in two
-patterns, then checks that reconciliation is clean and that the wallets still hold exactly the money
-deposited. Measured on an Apple M5 laptop (app with 4 worker processes, Postgres 17, and the load generator
+patterns, then checks that every request got a real answer (a transfer or `INSUFFICIENT_FUNDS`, never a 5xx,
+timeout or dropped connection), that reconciliation is clean, and that the wallets still hold exactly the money
+deposited. It exits 1 otherwise, which makes it a CI gate. (The answer check matters: money is also "conserved"
+when every transfer fails. Against a server with a 1 ms lock timeout, the earlier version exited 0 while 1,718
+of 3,000 transfers came back `503`.) Measured on an Apple M5 laptop (app with 4 worker processes, Postgres 17, and the load generator
 all on the same machine), 100 concurrent clients; throughput over seven runs, latency over the last three:
 
 | Scenario | Throughput | p50 | p99 |
@@ -284,15 +287,20 @@ small, but it has to get the same details right as any client that moves money:
 ## Run it
 
 ```bash
-docker compose up --build -d
+docker compose up --build -d --wait    # returns once the app's health check passes
 docker compose exec app tally demo     # sample accounts and transactions
 open http://localhost:8000             # the console; API docs at /docs
 ```
 
+Ports are published on `127.0.0.1` only (the database password is `tally`); if 8000 or 5432 is taken, set
+`TALLY_PORT` or `TALLY_DB_PORT`. The ledger lives in a named volume, so it survives `docker compose down`;
+`down -v` deletes it. The image installs the exact dependency versions in
+[`requirements.txt`](requirements.txt), the same ones CI tests, and Dependabot proposes updates weekly.
+
 Without Docker, against your own PostgreSQL (tested on 17):
 
 ```bash
-python -m venv .venv && source .venv/bin/activate && pip install -e ".[dev]"
+python -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt -e ".[dev]"
 export TALLY_DATABASE_URL=postgresql://user:pass@localhost:5432/tally
 tally migrate && tally demo && tally serve
 tally reconcile                        # exit code 1 if anything disagrees
@@ -334,7 +342,7 @@ node --test 'tests/js/*.test.js'   # the console's money and idempotency logic (
 # export DOCKER_HOST=unix://$HOME/.docker/run/docker.sock
 ```
 
-172 Python tests, all against a real PostgreSQL because the rules under test live in the database, plus 11 for the console's JavaScript. Branch coverage is 98%; warnings fail the run.
+173 Python tests, all against a real PostgreSQL because the rules under test live in the database, plus 11 for the console's JavaScript. Branch coverage is 98%; warnings fail the run.
 
 | Suite | What it covers |
 |---|---|
@@ -343,7 +351,7 @@ node --test 'tests/js/*.test.js'   # the console's money and idempotency logic (
 | `test_database_invariants.py` (30) | **Raw SQL that bypasses the app** to try to break each rule, and gets rejected |
 | `test_concurrency.py` (4) | 50 threads draining one account, opposite-direction transfers, one idempotency key from 20 threads, concurrent reversals. Each race gets its own pool, filled first, so all 60 transactions really run at once, and fails if any transaction was retried, so a deadlock can't hide behind `db.run`'s retries |
 | `test_api.py` (9) | HTTP contract, idempotent replay, key reuse, problem details, pagination, holds, reconciliation |
-| `test_api_errors.py` (21) | A real row lock becomes `503 LOCK_TIMEOUT`; timeouts, pool exhaustion and outages become 503s; constraint names and crashes don't leak; oversized and chunked bodies get 413; naive timestamps and forged cursors are rejected; paging 120 holds that share one timestamp; optional idempotency; `Location` headers |
+| `test_api_errors.py` (22) | A real row lock becomes `503 LOCK_TIMEOUT`; timeouts, pool exhaustion and outages become 503s; constraint names and crashes don't leak; oversized and chunked bodies get 413; naive timestamps and forged cursors are rejected; paging 120 holds that share one timestamp; optional idempotency; `Location` headers; error codes that don't depend on the Python version |
 | `test_cli.py` (16) | Exit codes (0 / 1 for discrepancies / 2 for a database that's down, unmigrated or edited), fast failure without a pool timeout, demo refusing a non-empty ledger, rolling back when it fails halfway, two demos at once seeding once, argument and config validation, Ctrl-C |
 | `test_console.py` (3), `tests/js/` (11) | The console's CSP and cache revalidation; exact money parsing and formatting per currency; one idempotency key per intent (double clicks send one request, retries reuse the key, definite answers retire it) |
 | `test_idempotency.py` (8) | Run once and replay, key reuse, per-operation scope, failed requests not remembered, a retry racing the original, a key purged mid-claim, batched purge |
@@ -362,8 +370,12 @@ Tests are only worth what they catch, so the important ones were checked by plan
   six passed with the bug in place. Now all six runs fail.
 - The maintenance loop processing one batch per run, or letting an exception kill the thread: each breaks a test.
 
-CI runs lint and the full suite with Testcontainers, then boots the Docker Compose stack, runs a load test
-against it, and runs `tally reconcile` inside the container.
+CI runs the suite on Python 3.11 (the oldest `pyproject.toml` allows) and 3.13 (what the image runs), plus
+lint and the JavaScript tests, then builds the image, starts the Compose stack, runs the load test against it
+and `tally reconcile` inside the container. Testing 3.11 paid off at once: the framework's error codes were
+derived from `HTTPStatus` names, which Python 3.13 renamed (`413` was `REQUEST_ENTITY_TOO_LARGE`), so the same
+error had a different `code` depending on the server's Python. The workflow token is read-only, runs time out
+after 15 minutes, and a newer push cancels the older run.
 
 ## Project layout
 
@@ -381,8 +393,9 @@ src/tally/
 ├── api.py, schemas.py      FastAPI routes, Pydantic models, RFC 9457 errors
 ├── cli.py                  tally migrate | serve | reconcile | demo
 └── static/                 the console (plain JS modules, no build step)
-scripts/load_test.py        concurrent load test + conservation check
-scripts/index_benchmark.py  EXPLAIN ANALYZE before/after migration 002 on 2M entries
+scripts/load_test.py        concurrent load test: answers, reconciliation, conservation; exits 1 on any failure
+scripts/index_benchmark.py  EXPLAIN ANALYZE before/after migration 002 on 2M entries (refuses non-bench databases)
+requirements.txt            exact runtime versions for the image and CI (Dependabot keeps them current)
 ```
 
 ## Not built (yet)

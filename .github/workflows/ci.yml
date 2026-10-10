@@ -5,38 +5,52 @@ on:
     branches: [main]
   pull_request:
 
+# The workflow only reads the repository; a compromised step can't push or publish.
+permissions:
+  contents: read
+
+# A newer push to the same branch makes the older run pointless.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
-    name: Lint + tests (real Postgres via Testcontainers)
-    runs-on: ubuntu-latest
+    name: Tests on Python ${{ matrix.python }} (real Postgres via Testcontainers)
+    # Pinned rather than ubuntu-latest, so the OS changes in a PR of our own, not under us.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.13"] # the oldest version pyproject.toml promises, and the one the image runs
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
-          python-version: "3.13"
+          python-version: ${{ matrix.python }}
           cache: pip
-      - run: pip install -e ".[dev]"
-      - run: ruff check src tests scripts
-      - run: ruff format --check src tests scripts
-      - run: pytest -q --cov  # fails under 90% branch coverage (pyproject.toml)
-      - uses: actions/setup-node@v5
+      - run: pip install -r requirements.txt -e ".[dev]"
+      - if: matrix.python == '3.13'
+        run: ruff check src tests scripts && ruff format --check src tests scripts
+      - run: pytest -q --cov # fails under 90% branch coverage (pyproject.toml)
+      - if: matrix.python == '3.13'
+        uses: actions/setup-node@v5
         with:
           node-version: "24"
-      - run: node --test 'tests/js/*.test.js'
+      - if: matrix.python == '3.13'
+        run: node --test 'tests/js/*.test.js'
 
   load-test:
     name: Docker Compose + load test + reconciliation
     needs: test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
-      - name: Start the stack
+      - name: Start the stack and wait until the app's health check passes
         run: docker compose up -d --build --wait
-      - name: Wait for the API
-        run: |
-          for i in $(seq 1 30); do curl -sf localhost:8000/health && exit 0; sleep 2; done
-          exit 1
-      - name: Concurrent transfers (spread and single hot account)
+      - name: Concurrent transfers (fails on any 5xx, timeout or unbalanced books)
         run: python3 scripts/load_test.py --requests 2000 --concurrency 30
       - name: The books still balance, recomputed from raw entries
         run: docker compose exec -T app tally reconcile
