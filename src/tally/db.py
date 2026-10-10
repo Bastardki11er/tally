@@ -67,16 +67,46 @@ def _migration_files() -> list[tuple[str, str]]:
 
 MIGRATION_LOCK_ID = 7_301_984_221  # any constant; shared by every app instance
 
+NO_TRANSACTION = "-- migration: no-transaction"
 
-def migrate(url: str) -> list[str]:
-    """Applies pending migrations in order, each in its own transaction.
+
+def _statements(sql: str) -> list[str]:
+    """Splits a simple DDL file on semicolons (no function bodies allowed in such files)."""
+    code = "\n".join(line for line in sql.splitlines() if not line.lstrip().startswith("--"))
+    return [statement.strip() for statement in code.split(";") if statement.strip()]
+
+
+def _acquire_migration_lock(conn: psycopg.Connection, timeout_seconds: float = 600) -> None:
+    """Waits for the migration lock by polling rather than blocking in pg_advisory_lock().
+
+    A session blocked inside pg_advisory_lock() is mid-statement, so it counts as an
+    open transaction, and CREATE INDEX CONCURRENTLY waits for every open transaction
+    to finish. The instance building the index would wait for the waiters while they
+    wait for its lock: a deadlock. pg_try_advisory_lock() returns immediately, so
+    between attempts there is nothing for the index build to wait on.
+    """
+    deadline = time.monotonic() + timeout_seconds
+    while not conn.execute("SELECT pg_try_advisory_lock(%s)", (MIGRATION_LOCK_ID,)).fetchone()[0]:
+        if time.monotonic() > deadline:
+            raise TimeoutError("timed out waiting for another instance to finish migrating")
+        time.sleep(0.2)
+
+
+def migrate(url: str, until: str | None = None) -> list[str]:
+    """Applies pending migrations in order, stopping after version ``until`` if given.
+
+    Each migration runs in its own transaction, so a failure leaves no half-applied
+    schema. The exception is a file starting with ``-- migration: no-transaction``:
+    its statements run one by one in autocommit mode, because ``CREATE INDEX
+    CONCURRENTLY`` (building an index without blocking writes) refuses to run inside
+    a transaction. Such files must be safe to re-run after a crash.
 
     A Postgres advisory lock makes this safe when several instances start at once:
     one applies the migrations, the others wait and then find nothing to do.
     """
     applied: list[str] = []
     with psycopg.connect(url, autocommit=True) as conn:
-        conn.execute("SELECT pg_advisory_lock(%s)", (MIGRATION_LOCK_ID,))
+        _acquire_migration_lock(conn)
         try:
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS schema_migrations "
@@ -84,13 +114,19 @@ def migrate(url: str) -> list[str]:
             )
             done = {row[0] for row in conn.execute("SELECT version FROM schema_migrations")}
             for version, sql in _migration_files():
-                if version in done:
-                    continue
-                with conn.transaction():
-                    conn.execute(sql)
-                    conn.execute("INSERT INTO schema_migrations (version) VALUES (%s)", (version,))
-                applied.append(version)
-                log.info("applied migration %s", version)
+                if version not in done:
+                    if sql.lstrip().startswith(NO_TRANSACTION):
+                        for statement in _statements(sql):
+                            conn.execute(statement)
+                        conn.execute("INSERT INTO schema_migrations (version) VALUES (%s)", (version,))
+                    else:
+                        with conn.transaction():
+                            conn.execute(sql)
+                            conn.execute("INSERT INTO schema_migrations (version) VALUES (%s)", (version,))
+                    applied.append(version)
+                    log.info("applied migration %s", version)
+                if version == until:
+                    break
         finally:
             conn.execute("SELECT pg_advisory_unlock(%s)", (MIGRATION_LOCK_ID,))
     return applied

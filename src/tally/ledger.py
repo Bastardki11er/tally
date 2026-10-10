@@ -340,8 +340,12 @@ class Ledger:
     def balance_at(self, conn: Connection, account_id: int, as_of: datetime) -> int:
         """The account's posted balance at a moment in the past, read from the running balance."""
         self.get_account(conn, account_id)
+        # Within one account posted_at rises with id (it is taken under the row lock),
+        # so this is "the latest entry at or before as_of", answered by one probe of
+        # the (account_id, posted_at, id) index however far back as_of is.
         row = conn.execute(
-            "SELECT balance_after FROM entries WHERE account_id = %s AND posted_at <= %s ORDER BY id DESC LIMIT 1",
+            "SELECT balance_after FROM entries WHERE account_id = %s AND posted_at <= %s "
+            "ORDER BY posted_at DESC, id DESC LIMIT 1",
             (account_id, as_of),
         ).fetchone()
         return row["balance_after"] if row else 0

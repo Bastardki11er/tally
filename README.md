@@ -108,6 +108,37 @@ Design choices you can see in the schema ([`migrations/001_ledger.sql`](migratio
 - **`clock_timestamp()` instead of `now()`** for `posted_at`. `now()` is the start of the database transaction, which can be earlier than the moment the row lock was acquired. That would let a later entry carry an earlier timestamp and break point-in-time balances.
 - **A partial index** (`WHERE status = 'active'`) keeps the hold-expiry scan small no matter how many settled holds pile up.
 
+### Indexes, measured
+
+[`migrations/002_query_indexes.sql`](migrations/002_query_indexes.sql) adds two indexes. I found the slow queries by
+reading their plans on a realistic data set rather than guessing, and
+[`scripts/index_benchmark.py`](scripts/index_benchmark.py) reproduces the numbers. It loads 1M transactions /
+2M entries spread over a year, with one hot merchant account in 20% of them, and runs `EXPLAIN ANALYZE` on the
+same data before and after the migration (median of warm runs, PostgreSQL 17 on an Apple M5):
+
+| Query | Before | After |
+|---|---|---|
+| Balance as of Jan 8, hot account (200k entries) | 112.5 ms: walked the **whole table's primary key** backwards, filtering every row | 0.003 ms: one probe of `(account_id, posted_at, id)` |
+| Balance as of Dec 10, hot account | 0.94 ms | 0.002 ms |
+| Balance as of Jan 8, typical account (~1.8k entries) | 0.19 ms | 0.002 ms |
+| Recent transactions feed (latest 20 of 1M) | 83.6 ms: sequential scan + sort of 1M rows | 0.008 ms: backward scan of `(posted_at, id)` |
+
+The surprise was the first row: Postgres did not use the existing `(account_id, id)` index at all, and scanned
+the entire primary key instead. The fix also needed a query change. Within one account, `posted_at` rises with
+`id`, because it is taken under the account's row lock. So `ORDER BY posted_at DESC, id DESC` returns the same
+row as `ORDER BY id DESC`, and that order matches the new index.
+
+Indexes cost writes, so I re-ran the load test after the migration: spread 3,000–3,130 transfers/s (was
+3,050–3,150), hotspot 1,560–1,620/s (was 1,590–1,640). At this data size that is within run-to-run noise.
+
+**Adding indexes to a live ledger.** The migration uses `CREATE INDEX CONCURRENTLY`, which doesn't block writes
+but can't run inside a transaction, so the migration runner supports a `-- migration: no-transaction` marker.
+That surfaced a real bug: when several app workers booted at once, the ones blocked in `pg_advisory_lock()`
+counted as open transactions, and `CREATE INDEX CONCURRENTLY` waits for all open transactions to finish, while
+the index builder held the lock they were waiting for. Postgres reported a deadlock and startup failed. The
+runner now polls with `pg_try_advisory_lock()`, and
+`test_instances_starting_at_the_same_time_migrate_once_without_deadlocking` reproduces the race.
+
 ## Concurrency
 
 Every operation locks the account rows it touches with `SELECT ... FOR UPDATE`, **always in ascending
@@ -199,7 +230,7 @@ tally reconcile                        # exit code 1 if anything disagrees
 pytest -q        # starts a throwaway postgres:17 container, or set TALLY_TEST_DATABASE_URL
 ```
 
-43 tests, all against a real PostgreSQL, because the rules under test live in the database:
+49 tests, all against a real PostgreSQL, because the rules under test live in the database:
 
 | Suite | What it covers |
 |---|---|
@@ -208,6 +239,7 @@ pytest -q        # starts a throwaway postgres:17 container, or set TALLY_TEST_D
 | `test_database_invariants.py` (10) | **Raw SQL that bypasses the app** to try to break each rule, and gets rejected |
 | `test_concurrency.py` (4) | 50 threads draining one account, opposite-direction transfers, one idempotency key from 20 threads, concurrent reversals |
 | `test_api.py` (9) | HTTP contract, idempotent replay, key reuse, problem details, pagination, holds, reconciliation |
+| `test_migrations.py` (6) | Ordered, idempotent migrations; valid concurrent indexes; the hot queries use them; four instances migrating at once without deadlocking |
 | `test_invariants.py` | **Model-based testing**: Hypothesis generates 40 random sequences of up to 30 operations (deposits, transfers, holds, captures, voids, reversals). After *every* step it checks that reconciliation is clean, the database matches an in-memory model balance for balance, and no protected account is overdrawn |
 
 To check that the model-based test has teeth, I planted a bug: a partial capture that releases only the
@@ -220,6 +252,7 @@ against it, and runs `tally reconcile` inside the container.
 
 ```
 migrations/001_ledger.sql   schema, constraints, triggers: the rules of the ledger
+migrations/002_*.sql        indexes for the slow queries, built CONCURRENTLY
 src/tally/
 ├── ledger.py               posting, transfers, holds, reversals, statements (ordered row locks)
 ├── idempotency.py          idempotency keys in the same transaction as the operation
@@ -229,6 +262,7 @@ src/tally/
 ├── cli.py                  tally migrate | serve | reconcile | demo
 └── static/                 the console (plain JS, no build step)
 scripts/load_test.py        concurrent load test + conservation check
+scripts/index_benchmark.py  EXPLAIN ANALYZE before/after migration 002 on 2M entries
 ```
 
 ## Not built (yet)
