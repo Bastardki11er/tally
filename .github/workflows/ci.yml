@@ -35,7 +35,7 @@ jobs:
         run: ruff check src tests scripts && ruff format --check src tests scripts
       - run: pytest -q --cov # fails under 90% branch coverage (pyproject.toml)
       - if: matrix.python == '3.13'
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@v7
         with:
           node-version: "24"
       - if: matrix.python == '3.13'
