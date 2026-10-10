@@ -19,7 +19,6 @@ import threading
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
-from http import HTTPStatus
 from pathlib import Path
 from typing import Annotated, Any, Literal
 from uuid import UUID
@@ -186,9 +185,22 @@ class BodySizeLimit:
         await self.app(scope, counted_receive, send)
 
 
+# Codes for the errors the framework raises itself. Spelled out rather than taken from
+# HTTPStatus(...).name: Python 3.13 renamed several (413 was REQUEST_ENTITY_TOO_LARGE in
+# 3.11), and a client's `code` mustn't change with the server's Python version.
+FRAMEWORK_CODES = {
+    400: "BAD_REQUEST",
+    404: "NOT_FOUND",
+    405: "METHOD_NOT_ALLOWED",
+    413: "CONTENT_TOO_LARGE",
+    416: "RANGE_NOT_SATISFIABLE",
+}
+
+
 def http_problem(request: Request | None, exc: StarletteHTTPException) -> JSONResponse:
     """Framework errors (unknown route, wrong method, body too large) as problem documents too."""
-    return problem(exc.status_code, HTTPStatus(exc.status_code).name, str(exc.detail), headers=exc.headers)
+    code = FRAMEWORK_CODES.get(exc.status_code, f"HTTP_{exc.status_code}")
+    return problem(exc.status_code, code, str(exc.detail), headers=exc.headers)
 
 
 def _maintenance_loop(db: Database, ledger: Ledger, interval: float, stop: threading.Event) -> None:
