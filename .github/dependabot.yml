@@ -1,10 +1,14 @@
 # Weekly PRs for newer dependencies; each one has to pass CI before it's merged.
 version: 2
 updates:
-  - package-ecosystem: pip # requirements.txt (the pinned runtime) and pyproject.toml
+  - package-ecosystem: pip
     directory: /
     schedule:
       interval: weekly
+    # Move the exact pins in requirements.txt (what the image ships), but leave the
+    # ">=" ranges in pyproject.toml alone unless a new version falls outside them:
+    # raising a floor just because a newer release exists only narrows what installs.
+    versioning-strategy: increase-if-necessary
     groups:
       python:
         patterns: ["*"]
@@ -16,3 +20,6 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    groups: # one PR for all actions instead of one each
+      actions:
+        patterns: ["*"]
