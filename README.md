@@ -374,8 +374,9 @@ CI runs the suite on Python 3.11 (the oldest `pyproject.toml` allows) and 3.13 (
 lint and the JavaScript tests, then builds the image, starts the Compose stack, runs the load test against it
 and `tally reconcile` inside the container. Testing 3.11 paid off at once: the framework's error codes were
 derived from `HTTPStatus` names, which Python 3.13 renamed (`413` was `REQUEST_ENTITY_TOO_LARGE`), so the same
-error had a different `code` depending on the server's Python. The workflow token is read-only, runs time out
-after 15 minutes, and a newer push cancels the older run.
+error had a different `code` depending on the server's Python. The workflow token is read-only, actions are
+pinned to commit SHAs (a tag can be moved to other code, a commit can't), runs time out after 15 minutes, and a
+newer push cancels the older run.
 
 ## Project layout
 
