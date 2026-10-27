@@ -111,11 +111,9 @@ class RequestContext:
             route = getattr(scope.get("route"), "path", "unmatched")
             REQUEST_SECONDS.labels(scope["method"], route, str(status)).observe(seconds)
             if scope["path"] not in QUIET_PATHS:
-                access_log.info(
-                    "%s %s %s",
-                    scope["method"],
-                    scope["path"],
-                    status,
-                    extra={"method": scope["method"], "route": route, "status": status, "ms": round(seconds * 1000, 1)},
-                )
+                actor = scope.get("state", {}).get("actor")  # set by authentication, if it ran
+                fields = {"method": scope["method"], "route": route, "status": status, "ms": round(seconds * 1000, 1)}
+                if actor:
+                    fields |= {"client_id": actor.client_id, "api_key_id": actor.key_id}
+                access_log.info("%s %s %s", scope["method"], scope["path"], status, extra=fields)
             request_id.reset(token)

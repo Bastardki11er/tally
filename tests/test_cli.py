@@ -184,3 +184,48 @@ def test_ctrl_c_exits_130_without_a_traceback(monkeypatch):
     monkeypatch.setattr(cli, "migrate", interrupted)
 
     assert main(["migrate"]) == EXIT_INTERRUPTED
+
+
+# --- API keys -----------------------------------------------------------------------
+
+
+def test_create_client_prints_only_the_key_on_stdout(capsys, db):
+    from tally import auth
+
+    assert main(["create-client", "acme"]) == EXIT_OK
+    out, err = capsys.readouterr()
+
+    key = out.strip()  # what `KEY=$(tally create-client acme)` captures
+    assert key.startswith("tly_") and "\n" not in key
+    assert "shown once" in err
+    assert db.run(lambda conn: auth.find_key(conn, key)) is not None
+
+
+def test_a_revoked_key_stops_working_and_is_listed_as_revoked(capsys, db):
+    from tally import auth
+
+    main(["create-client", "acme"])
+    key = capsys.readouterr().out.strip()
+    key_id = db.run(lambda conn: auth.find_key(conn, key)).key_id
+
+    assert main(["revoke-key", str(key_id)]) == EXIT_OK
+    assert db.run(lambda conn: auth.find_key(conn, key)) is None
+    capsys.readouterr()
+    assert main(["list-keys"]) == EXIT_OK
+    assert "acme" in (listing := capsys.readouterr().out) and "revoked" in listing
+
+
+@pytest.mark.parametrize(
+    ("argv", "code"),
+    [(["create-key", "nobody"], "CLIENT_NOT_FOUND"), (["revoke-key", "999"], "KEY_NOT_FOUND")],
+)
+def test_unknown_clients_and_keys_are_one_line_errors(capsys, argv, code):
+    assert main(argv) == EXIT_ERROR
+    assert capsys.readouterr().err.startswith(f"tally: error: {code}")
+
+
+def test_a_taken_client_name_is_refused(capsys):
+    main(["create-client", "acme"])
+
+    assert main(["create-client", "acme"]) == EXIT_ERROR
+    assert "CLIENT_EXISTS" in capsys.readouterr().err

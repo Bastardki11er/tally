@@ -59,9 +59,25 @@ function serialized(fn) {
 
 // ---- API ------------------------------------------------------------------
 
+// The key decides whose books the console shows. sessionStorage: this tab only, and
+// gone when it closes. Storage can be unavailable (private windows), hence the try.
+const KEY_STORAGE = "tally-api-key";
+const storedKey = () => {
+  try {
+    return sessionStorage.getItem(KEY_STORAGE);
+  } catch {
+    return state.memoryKey ?? null;
+  }
+};
+
+function askForKey() {
+  if (!$("#key-dialog").open) $("#key-dialog").showModal();
+}
+
 async function api(method, path, body, idempotencyKey) {
   const headers = body ? { "Content-Type": "application/json" } : {};
   if (idempotencyKey) headers["Idempotency-Key"] = idempotencyKey;
+  if (storedKey()) headers.Authorization = `Bearer ${storedKey()}`;
   let response, text;
   try {
     response = await fetch(path, { method, headers, body: body ? JSON.stringify(body) : undefined });
@@ -79,6 +95,7 @@ async function api(method, path, body, idempotencyKey) {
     state.lastRequest = { method, path, body, idempotencyKey, status: response.status, replayed: response.headers.get("Idempotent-Replayed"), code: data?.code };
     renderLastRequest();
   }
+  if (response.status === 401) askForKey();
   if (!response.ok) throw new ApiError(response.status, data);
   return data;
 }
@@ -589,13 +606,30 @@ const refresh = serialized(async () => {
     if (!$("#offline").hidden) checkBooks(); // back online: don't wait a minute to re-check
     $("#offline").hidden = true;
   } catch (error) {
+    if (error.status === 401) return; // the key dialog is already asking
     // A banner, not a toast: polling would otherwise stack a new toast every few seconds.
     $("#offline").textContent = `Can't load the ledger (${error.message}). Retrying every ${REFRESH_EVERY_MS / 1000} s.`;
     $("#offline").hidden = false;
   }
 });
 
-const visible = () => !document.hidden;
+$("#change-key").onclick = askForKey;
+$("#key-form").addEventListener("submit", () => {
+  const key = $("#key-form").key.value.trim();
+  try {
+    sessionStorage.setItem(KEY_STORAGE, key);
+  } catch {
+    state.memoryKey = key;
+  }
+  // Another key can mean another client's books: forget everything shown so far.
+  Object.assign(state, { accounts: [], accountPages: 1, pinned: new Set(), names: new Map(), rendered: {} });
+  $("#key-form").reset();
+  refresh();
+  checkBooks();
+});
+
+// Don't poll while a dialog is up: nothing to show behind the account view, and no key yet behind the key prompt.
+const visible = () => !document.hidden && !$("#key-dialog").open;
 setInterval(() => visible() && !$("#account-dialog").open && refresh(), REFRESH_EVERY_MS);
 setInterval(() => visible() && checkBooks(), RECONCILE_EVERY_MS);
 refresh();

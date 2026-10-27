@@ -10,9 +10,8 @@ committed key and returns the stored response. That relies on READ COMMITTED
 (Postgres' default, and what tally.db uses); under REPEATABLE READ the INSERT
 would raise a serialization error instead.
 
-Keys are global per operation, because Tally has no notion of separate API
-clients yet. Once it does, the client's id must become part of the key, or one
-client could receive another client's stored response.
+Keys are per client: the API puts the client's id into ``scope``, so two clients
+can pick the same key without one ever receiving the other's stored response.
 """
 
 from __future__ import annotations

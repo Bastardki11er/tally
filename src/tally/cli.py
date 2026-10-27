@@ -5,12 +5,19 @@ tally serve         run the HTTP API (and the demo console at /)
 tally reconcile     recompute all balances from the raw entries
 tally demo          seed demo accounts and transactions into an empty ledger
 
+tally create-client NAME   a new API client and its first key
+tally create-key CLIENT    another key for a client (to rotate keys without downtime)
+tally revoke-key KEY_ID    stop accepting a key
+tally list-keys            every key, by client, and whether it is revoked
+  New keys go to stdout alone, so a script can capture them: KEY=$(tally create-client app)
+
 Exit codes, so scripts and schedulers can tell the cases apart:
   0  done (for reconcile: the books agree)
   1  reconcile found discrepancies
   2  the command couldn't run: bad arguments or configuration, database
      unreachable or not migrated, migration history doesn't match the code,
-     or demo asked to seed a ledger that already has accounts
+     demo asked to seed a ledger that already has accounts, or a client or key
+     that doesn't exist (or a client name that's taken)
 """
 
 from __future__ import annotations
@@ -26,8 +33,10 @@ import psycopg
 from fastapi.encoders import jsonable_encoder
 from psycopg.rows import dict_row
 
+from . import auth
 from .config import Settings
 from .db import MigrationError, migrate, session_limits
+from .errors import LedgerError
 from .ledger import Ledger, Leg
 from .reconciliation import reconcile
 
@@ -56,6 +65,8 @@ def main(argv: list[str] | None = None) -> int:
         return fail(f"database: {str(exc).strip()}")
     except (CommandError, MigrationError, TimeoutError) as exc:
         return fail(str(exc))
+    except LedgerError as exc:
+        return fail(f"{exc.code}: {exc.message}")
     except KeyboardInterrupt:
         return EXIT_INTERRUPTED
 
@@ -93,6 +104,17 @@ def build_parser() -> argparse.ArgumentParser:
     check.set_defaults(handler=reconcile_command)
 
     commands.add_parser("demo", help="seed demo data into an empty ledger").set_defaults(handler=demo_command)
+
+    client = commands.add_parser("create-client", help="a new API client and its first key")
+    client.add_argument("name")
+    client.set_defaults(handler=create_client_command)
+    key = commands.add_parser("create-key", help="another key for an existing client")
+    key.add_argument("client", help="the client's name")
+    key.set_defaults(handler=create_key_command)
+    revoke = commands.add_parser("revoke-key", help="stop accepting a key")
+    revoke.add_argument("key_id", type=positive_int)
+    revoke.set_defaults(handler=revoke_key_command)
+    commands.add_parser("list-keys", help="every API key and its client").set_defaults(handler=list_keys_command)
     return parser
 
 
@@ -157,6 +179,46 @@ def reconcile_command(args: argparse.Namespace, settings: Settings) -> int:
     return EXIT_OK
 
 
+def show_new_key(record: dict, key: str, client: str) -> None:
+    # The key alone on stdout, so `KEY=$(tally create-client app)` captures just it.
+    print(key)
+    print(
+        f"API key {record['id']} for client {client!r}: shown once, store it now. "
+        f"Revoke it with `tally revoke-key {record['id']}`.",
+        file=sys.stderr,
+    )
+
+
+def create_client_command(args: argparse.Namespace, settings: Settings) -> int:
+    with connect(settings) as conn, conn.transaction():
+        record, key = auth.create_client(conn, args.name)
+    show_new_key(record, key, args.name)
+    return EXIT_OK
+
+
+def create_key_command(args: argparse.Namespace, settings: Settings) -> int:
+    with connect(settings) as conn, conn.transaction():
+        record, key = auth.create_key(conn, args.client)
+    show_new_key(record, key, args.client)
+    return EXIT_OK
+
+
+def revoke_key_command(args: argparse.Namespace, settings: Settings) -> int:
+    with connect(settings) as conn, conn.transaction():
+        record = auth.revoke_key(conn, args.key_id)
+    print(f"key {record['id']} ({record['key_prefix']}...) revoked at {record['revoked_at']:%Y-%m-%d %H:%M:%S %Z}")
+    return EXIT_OK
+
+
+def list_keys_command(args: argparse.Namespace, settings: Settings) -> int:
+    with connect(settings) as conn:
+        keys = auth.list_keys(conn)
+    for k in keys:
+        state = f"revoked {k['revoked_at']:%Y-%m-%d}" if k["revoked_at"] else "active"
+        print(f"{k['id']:>5}  {k['client']:<20}  {k['key_prefix']}...  created {k['created_at']:%Y-%m-%d}  {state}")
+    return EXIT_OK
+
+
 def demo_command(args: argparse.Namespace, settings: Settings) -> int:
     migrate(settings.database_url)
     # One transaction: if any step fails, or someone presses Ctrl-C, nothing is left
@@ -167,14 +229,21 @@ def demo_command(args: argparse.Namespace, settings: Settings) -> int:
         conn.execute("SELECT pg_advisory_xact_lock(%s)", (DEMO_LOCK_ID,))
         if conn.execute("SELECT EXISTS (SELECT 1 FROM accounts) AS used").fetchone()["used"]:
             raise CommandError("the ledger already has accounts; demo data only goes into an empty database")
-        seed_demo(conn)
-    print("demo data created; the console is at / on the API server (http://localhost:8000/ by default)")
+        exists = conn.execute("SELECT 1 FROM api_clients WHERE name = 'demo'").fetchone()
+        record, key = auth.create_key(conn, "demo") if exists else auth.create_client(conn, "demo")
+        seed_demo(conn, record["client_id"])
+    show_new_key(record, key, "demo")
+    print(
+        "demo data created; open the console (/ on the API server, http://localhost:8000/ by default) "
+        "and paste the key above",
+        file=sys.stderr,
+    )
     return EXIT_OK
 
 
-def seed_demo(conn: psycopg.Connection) -> None:
+def seed_demo(conn: psycopg.Connection, client_id: int) -> None:
     """A tiny wallet business: customers deposit cash, pay each other, and the platform takes a fee."""
-    ledger = Ledger()
+    ledger = Ledger(client_id)
 
     cash = ledger.create_account(conn, "Bank account (cash)", "asset", "USD")
     fees = ledger.create_account(conn, "Fee revenue", "revenue", "USD")

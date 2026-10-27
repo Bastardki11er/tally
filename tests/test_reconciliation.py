@@ -26,10 +26,11 @@ def insert_entry(db, account_id, direction, amount, currency="USD", balance_afte
 
     def run(conn):
         conn.execute("SET LOCAL session_replication_role = replica")
-        txn = conn.execute("INSERT INTO transactions DEFAULT VALUES RETURNING id").fetchone()["id"]
+        txn = conn.execute("INSERT INTO transactions (client_id) VALUES (1) RETURNING id").fetchone()["id"]
         conn.execute(
-            "INSERT INTO entries (transaction_id, account_id, direction, amount, currency, balance_after, posted_at) "
-            "VALUES (%s, %s, %s, %s, %s, %s, coalesce(%s, clock_timestamp()))",
+            "INSERT INTO entries (client_id, transaction_id, account_id, direction, amount, currency, balance_after, "
+            "posted_at) "
+            "VALUES (1, %s, %s, %s, %s, %s, %s, coalesce(%s, clock_timestamp()))",
             (txn, account_id, direction, amount, currency, balance_after, posted_at),
         )
         return txn
@@ -136,3 +137,21 @@ def test_the_whole_report_describes_one_moment_even_while_transfers_commit(db, b
 
     assert all(report["ok"] for report in reports)
     assert all(report["entries"] == 2 * report["transactions"] for report in reports)
+
+
+def test_an_entry_crossing_into_another_clients_books_is_reported(db, ledger):
+    from tally import auth
+
+    db.run(lambda conn: auth.create_client(conn, "neighbour"))  # client 2
+    txn = insert_entry(db, ledger["alice"]["id"], "credit", 10, balance_after=760)
+
+    def move_to_client_2(conn):
+        conn.execute("SET LOCAL session_replication_role = replica")
+        conn.execute("UPDATE transactions SET client_id = 2 WHERE id = %s", (txn,))
+
+    db.run(move_to_client_2)
+    report = db.run(reconcile)
+
+    assert report["totals"]["client_mismatches"] == 1
+    (finding,) = report["client_mismatches"]
+    assert (finding["kind"], finding["transaction_client"], finding["account_client"]) == ("entry", 2, 1)
