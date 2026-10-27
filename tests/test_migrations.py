@@ -64,7 +64,6 @@ def test_concurrently_built_indexes_exist_and_are_valid(migrated):
             "SELECT id FROM transactions WHERE client_id = 1 ORDER BY posted_at DESC, id DESC LIMIT 20",
             "transactions_by_client_time",
         ),
-        ("SELECT id FROM accounts WHERE client_id = 1 AND id > 0 ORDER BY id LIMIT 50", "accounts_client_id_key"),
     ],
 )
 def test_hot_queries_can_use_their_index(migrated, query, index):

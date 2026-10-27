@@ -64,7 +64,7 @@ def test_metrics_report_latency_per_route_not_per_id(client):
 
     assert sample("tally_http_request_duration_seconds_count", **labels) == before + 2
     assert "tally_http_request_duration_seconds_bucket" in body
-    assert "999999" not in body
+    assert 'route="/v1/accounts/999999"' not in body  # one series per route template, not per id
 
 
 def test_metrics_count_errors_by_code(client):

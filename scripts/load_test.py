@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """Load test for the Tally API. Standard library only.
 
-Two scenarios:
+Three scenarios:
 
-  spread   random transfers between many wallets: little lock contention
-  hotspot  every customer pays the same merchant: every request needs the
-           same row lock, the worst case for a ledger
+  spread           random transfers between many wallets: little lock contention
+  hotspot          every customer pays the same merchant with a transfer: every
+                   request needs the same row lock, the worst case for a ledger
+  hotspot, batched the same payments as holds settled in batches
+                   (settle_to_account_id): only the payer's row is locked per
+                   request; the merchant is credited once per batch, a few
+                   seconds later, and the run waits for that to finish
 
 After each run it checks the things that must never break under load:
   * every request got a real answer: a transfer or INSUFFICIENT_FUNDS (a wallet
@@ -38,6 +42,7 @@ API_KEY = ""  # set from --api-key / TALLY_API_KEY in main()
 
 # The only refusal a correct ledger gives under this load: a wallet ran out of money.
 EXPECTED = {"ok", "INSUFFICIENT_FUNDS"}
+SETTLEMENT_TIMEOUT_SECONDS = 120
 
 
 def call(base, method, path, body=None, idempotent=False):
@@ -86,35 +91,48 @@ def setup(base, wallets, deposit):
     return ids, merchant
 
 
-def run(base, label, requests, concurrency, pick):
+def run(base, label, requests, concurrency, pick, batched=False):
+    """Returns the unexpected outcomes, and the total amount paid by the requests that succeeded."""
+
     def one(_):
         debit, credit, amount = pick()
+        if batched:  # a payment: reserve on the payer, settled to the merchant later
+            path, body = "/v1/holds", {"account_id": debit, "amount": amount, "settle_to_account_id": credit}
+        else:
+            path, body = "/v1/transfers", {"debit_account_id": debit, "credit_account_id": credit, "amount": amount}
         started = time.perf_counter()
         try:
-            status, body = call(
-                base,
-                "POST",
-                "/v1/transfers",
-                {"debit_account_id": debit, "credit_account_id": credit, "amount": amount},
-                idempotent=True,
-            )
-            outcome = "ok" if status == 201 else (body or {}).get("code", f"HTTP {status}")
+            status, answer = call(base, "POST", path, body, idempotent=True)
+            outcome = "ok" if status == 201 else (answer or {}).get("code", f"HTTP {status}")
         except (http.client.HTTPException, OSError) as error:
             outcome = f"no answer ({type(error).__name__})"
-        return outcome, (time.perf_counter() - started) * 1000
+        return outcome, (time.perf_counter() - started) * 1000, amount if outcome == "ok" else 0
 
     started = time.perf_counter()
     with ThreadPoolExecutor(max_workers=concurrency) as pool:
         results = list(pool.map(one, range(requests)))
     elapsed = time.perf_counter() - started
-    latencies = sorted(ms for _, ms in results)
+    latencies = sorted(ms for _, ms, _ in results)
     pct = lambda p: latencies[min(len(latencies) - 1, int(p / 100 * len(latencies)))]  # noqa: E731
-    print(f"\n[{label}] {requests} transfers, concurrency {concurrency}")
-    print(f"  throughput  {requests / elapsed:,.0f} transfers/s ({elapsed:.2f} s)")
+    print(f"\n[{label}] {requests} requests, concurrency {concurrency}")
+    print(f"  throughput  {requests / elapsed:,.0f} requests/s ({elapsed:.2f} s)")
     print(f"  latency     p50 {statistics.median(latencies):.1f} ms   p95 {pct(95):.1f} ms   p99 {pct(99):.1f} ms")
-    outcomes = Counter(o for o, _ in results)
+    outcomes = Counter(o for o, _, _ in results)
     print("  outcomes    " + ", ".join(f"{k}={v}" for k, v in sorted(outcomes.items())))
-    return {k: v for k, v in outcomes.items() if k not in EXPECTED}
+    return {k: v for k, v in outcomes.items() if k not in EXPECTED}, sum(paid for _, _, paid in results)
+
+
+def wait_for_settlement(base, merchant, expected_balance) -> bool:
+    """Polls the merchant until the settler has credited every accepted payment."""
+    started = time.perf_counter()
+    while time.perf_counter() - started < SETTLEMENT_TIMEOUT_SECONDS:
+        if call(base, "GET", f"/v1/accounts/{merchant}")[1]["balance"] == expected_balance:
+            waited = time.perf_counter() - started
+            print(f"  settled     all payments credited {waited:.1f} s after the last was accepted")
+            return True
+        time.sleep(0.2)
+    print(f"  settled     NOT within {SETTLEMENT_TIMEOUT_SECONDS} s")
+    return False
 
 
 def main():
@@ -143,8 +161,13 @@ def main():
         return random.choice(wallets), merchant, random.randint(1, 50)
 
     unexpected = Counter()
-    unexpected.update(run(base, "spread", args.requests, args.concurrency, spread))
-    unexpected.update(run(base, "hotspot", args.requests, args.concurrency, hotspot))
+    unexpected.update(run(base, "spread", args.requests, args.concurrency, spread)[0])
+    unexpected.update(run(base, "hotspot", args.requests, args.concurrency, hotspot)[0])
+    before = call(base, "GET", f"/v1/accounts/{merchant}")[1]["balance"]
+    batched_unexpected, paid = run(base, "hotspot, batched", args.requests, args.concurrency, hotspot, batched=True)
+    unexpected.update(batched_unexpected)
+    if not wait_for_settlement(base, merchant, before + paid):
+        unexpected["payments not settled"] += 1
 
     _, report = call(base, "GET", "/v1/reconciliation")
     held = sum(call(base, "GET", f"/v1/accounts/{a}")[1]["balance"] for a in [*wallets, merchant])

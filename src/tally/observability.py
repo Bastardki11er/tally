@@ -31,13 +31,14 @@ REQUEST_SECONDS = Histogram(
 )
 LOCK_WAIT_SECONDS = Histogram(
     "tally_account_lock_wait_seconds",
-    "Time spent acquiring account row locks (SELECT ... FOR UPDATE); grows with contention on hot accounts",
+    "Time spent acquiring account row locks (SELECT ... FOR NO KEY UPDATE); grows with contention on hot accounts",
     buckets=(0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5),
 )
 DB_RETRIES = Counter(
     "tally_db_retries_total", "Transactions retried after a deadlock or serialization failure", ["error"]
 )
 PROBLEMS = Counter("tally_problems_total", "Error responses, by problem code", ["code"])
+SETTLED = Counter("tally_settled_payments_total", "Payments (holds with a destination) settled in batches")
 
 # A caller-supplied ID ends up in logs and headers, so only plain tokens are accepted.
 REQUEST_ID_FORMAT = re.compile(r"[A-Za-z0-9._-]{1,64}")

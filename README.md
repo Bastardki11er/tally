@@ -198,7 +198,7 @@ long one included, don't hold the line back. Events are kept 7 days and purged i
 
 ## Concurrency
 
-Every operation locks the account rows it touches with `SELECT ... FOR UPDATE`, **always in ascending
+Every operation locks the account rows it touches with `SELECT ... FOR NO KEY UPDATE`, **always in ascending
 id order**. That ordering is what prevents deadlocks: A→B and B→A transfers at the same time queue up
 instead of each holding one lock and waiting for the other (`test_opposite_direction_transfers_do_not_deadlock`).
 A balance is checked and changed under the same lock, so no update is lost, and the code doesn't need
@@ -247,31 +247,49 @@ connection default is sized for requests. On 2M entries it takes about 3.5 s.
 
 ## Load test
 
-[`scripts/load_test.py`](scripts/load_test.py) funds 200 wallets, fires 10,000 concurrent transfers in two
-patterns, then checks that every request got a real answer (a transfer or `INSUFFICIENT_FUNDS`, never a 5xx,
-timeout or dropped connection), that reconciliation is clean, and that the wallets still hold exactly the money
-deposited. It exits 1 otherwise, which makes it a CI gate. (The answer check matters: money is also "conserved"
-when every transfer fails. Against a server with a 1 ms lock timeout, the earlier version exited 0 while 1,718
-of 3,000 transfers came back `503`.) Measured on an Apple M5 laptop (app with 4 worker processes, Postgres 17, and the load generator
-all on the same machine), 100 concurrent clients; throughput over seven runs, latency over the last three:
+[`scripts/load_test.py`](scripts/load_test.py) funds 200 wallets and fires concurrent payments in three patterns,
+then checks that every request got a real answer (a transfer or `INSUFFICIENT_FUNDS`, never a 5xx, timeout or
+dropped connection), that reconciliation is clean, and that the wallets still hold exactly the money deposited. It
+exits 1 otherwise, which makes it a CI gate. (The answer check matters: money is also "conserved" when every
+transfer fails. Against a server with a 1 ms lock timeout, an earlier version exited 0 while 1,718 of 3,000
+transfers came back `503`.)
 
-| Scenario | Throughput | p50 | p99 |
-|---|---|---|---|
-| **Spread**: random wallet to wallet | 3,200 – 3,560 transfers/s | 27 – 29 ms | 60 – 63 ms |
-| **Hotspot**: everyone pays one merchant | 1,570 – 1,820 transfers/s | 27 – 30 ms | 350 – 400 ms |
+Current code, measured on an Apple M5 laptop: app with 4 worker processes, load generator on the same machine,
+Postgres 17 in Docker Desktop, 5,000 requests per scenario from 100 concurrent clients, two runs:
 
-Every run: 20,000 transfers, reconciliation clean, money conserved. Moving balance updates into the database
-(migration 005) made both scenarios faster than before (3,050–3,150 and about 1,580/s), because each transfer
-now makes one fewer round trip, and that round trip used to happen while holding the account locks.
+| Scenario | Throughput | p50 | p99 | Mean wait for account locks |
+|---|---|---|---|---|
+| **Spread**: random wallet to wallet | 1,930 – 2,050 /s | 41 ms | 150 – 205 ms | |
+| **Hotspot**: everyone pays one merchant, by transfer | 560 – 575 /s | 40 – 52 ms | 1.7 – 1.8 s | 128 ms |
+| **Hotspot, batched**: the same payments, settled in batches | 1,990 – 2,060 /s | 34 – 37 ms | 195 – 225 ms | 16 ms |
 
-**The hotspot is the instructive number.** Spread traffic grows with the number of worker processes (it
-roughly doubled going from one worker to four). Hotspot traffic doesn't, because every transfer needs the
-merchant's row lock: about 1,600–1,800 transfers/s is that one row's ceiling, and p99 latency is 6x the spread
-case as requests queue behind it.
-Ways out, depending on the business: split the merchant into N sub-accounts that are summed for
-reporting; credit the merchant asynchronously in batches from a settlement queue; or keep the hot balance
-in a separate counter and fold it into the ledger periodically. Each one gives up immediate,
-per-transaction consistency on that one account.
+Every run: reconciliation clean, money conserved, no transaction retried, and every batched payment credited to
+the merchant within 0.6 s of the last one being accepted (settlement every second). Absolute numbers are lower than
+an earlier run against Postgres running natively on the same laptop (about 3,300/s spread and 1,600/s hotspot then):
+Docker Desktop runs Postgres in a VM. Compare rows, not runs.
+
+**The hotspot is the instructive number.** Spread traffic grows with the number of worker processes. Hotspot
+traffic doesn't, because every transfer needs the merchant's row lock: requests queue behind it, and p99 latency
+is ten times the spread case.
+
+**Batched settlement** removes the queue. A payment to a hot account is a hold with `settle_to_account_id`:
+creating it locks only the payer's row (the money is reserved, so it can't be spent twice), and a settler in each
+worker turns up to 100 pending payments into one transaction that debits every payer and credits the merchant
+once. That's how card payments work: authorize now, clear in batches. The merchant's lock is taken once per batch
+instead of once per payment, so the batched hotspot runs as fast as spread traffic, with the same tail latency.
+The cost is consistency on that one account: the merchant's balance trails by up to one settlement interval, while
+the payer's side is immediate. Two details made it work:
+
+- **Locks that don't block foreign keys.** The payment's foreign key to the merchant takes a `FOR KEY SHARE` lock
+  on the merchant's row, which `FOR UPDATE` blocks: payments would still have queued behind every settlement batch.
+  Accounts are now locked `FOR NO KEY UPDATE`, which excludes every other locker in Tally the same way but leaves
+  key-share locks alone (only balance and held change, never a key). `test_paying_never_waits_on_the_merchants_row`
+  holds the merchant's row the way Tally does and checks that a transfer times out while a payment goes through.
+- **Batches that stay cheap.** The deferred "debits = credits" check runs once per entry over the whole
+  transaction, so a batch costs the square of its size; 100 per batch (the API's own entry limit) keeps it to
+  milliseconds. Settlers in several workers run at once without stepping on each other (`SKIP LOCKED`), and a
+  payment that could never settle (one written around the API with the wrong currency) is voided and logged
+  instead of failing its batch forever.
 
 ## API
 
@@ -288,7 +306,7 @@ Every `/v1` route needs an API key: `Authorization: Bearer tly_...`. See [Client
 | `POST` | `/v1/transactions` 🔑 | Any balanced set of 2–100 entries (fees, splits, multi-currency) |
 | `GET` | `/v1/transactions`, `/v1/transactions/{id}` | Recent activity; one transaction with its entries |
 | `POST` | `/v1/transactions/{id}/reversal` 🔑 | Post the mirror image of a transaction |
-| `POST` | `/v1/holds` 🔑 | Reserve funds (card authorization), with expiry |
+| `POST` | `/v1/holds` 🔑 | Reserve funds (card authorization), with expiry; with `settle_to_account_id`, a payment settled in the next batch |
 | `POST` | `/v1/holds/{id}/capture` 🔑 | Settle a hold, optionally for less; the rest is released |
 | `POST` | `/v1/holds/{id}/void` 🗝️ | Release a hold |
 | `GET` | `/v1/events?cursor=` | Every change to your books, oldest first, without gaps (see [Events](#events-transactional-outbox)) |
@@ -356,6 +374,7 @@ small, but it has to get the same details right as any client that moves money:
 | `tally_account_lock_wait_seconds` | Time spent acquiring account row locks: the number that climbs when an account gets hot |
 | `tally_db_retries_total{error}` | Transactions retried after a deadlock or serialization failure; should stay at 0 |
 | `tally_problems_total{code}` | Error responses by code (`INSUFFICIENT_FUNDS`, `LOCK_TIMEOUT`, ...) |
+| `tally_settled_payments_total` | Payments settled by the batch settler |
 
 Under `tally serve --workers N` each worker is its own process with its own counters. The CLI points
 `PROMETHEUS_MULTIPROC_DIR` at a fresh directory before the workers start, so `/metrics` reports the sum over all
@@ -420,7 +439,7 @@ node --test 'tests/js/*.test.js'   # the console's money and idempotency logic (
 # export DOCKER_HOST=unix://$HOME/.docker/run/docker.sock
 ```
 
-215 Python tests, all against a real PostgreSQL because the rules under test live in the database, plus 11 for the console's JavaScript. Branch coverage is 98%; warnings fail the run.
+225 Python tests, all against a real PostgreSQL because the rules under test live in the database, plus 11 for the console's JavaScript. Branch coverage is 98%; warnings fail the run.
 
 | Suite | What it covers |
 |---|---|
@@ -432,13 +451,14 @@ node --test 'tests/js/*.test.js'   # the console's money and idempotency logic (
 | `test_api_errors.py` (22) | A real row lock becomes `503 LOCK_TIMEOUT`; timeouts, pool exhaustion and outages become 503s; constraint names and crashes don't leak; oversized and chunked bodies get 413; naive timestamps and forged cursors are rejected; paging 120 holds that share one timestamp; optional idempotency; `Location` headers; error codes that don't depend on the Python version |
 | `test_tenancy.py` (13) | Missing, malformed, unknown and revoked keys get `401`; key rotation; only a hash stored; another client's accounts, transactions and holds are `404` for every read and write and no money moves; idempotency keys per client; reconciliation per client; audit rows naming key and request, none for replays or failures, keyless rows for changes made around the API |
 | `test_events.py` (9) | One event per change with the transaction's entries; every kind of change; nothing for a rollback or a commit-time failure; per client; paging resumes exactly; an older transaction committing later is never skipped; batched purge; forged cursors |
+| `test_settlement.py` (11) | A payment reserves on the payer and pays the merchant at settlement, one transaction per batch; bounded batches; paying never waits on the merchant's row lock (a transfer does); destination validation; voided and expired payments skipped; two settlers at once settle each payment once; a payment written around the API can't stall settlement; the destination can't change |
 | `test_cli.py` (21) | Exit codes (0 / 1 for discrepancies / 2 for a database that's down, unmigrated or edited), fast failure without a pool timeout, demo refusing a non-empty ledger, rolling back when it fails halfway, two demos at once seeding once, argument and config validation, Ctrl-C; API keys: only the key on stdout, revoke and list, unknown clients and keys, taken names |
 | `test_console.py` (3), `tests/js/` (11) | The console's CSP and cache revalidation; exact money parsing and formatting per currency; one idempotency key per intent (double clicks send one request, retries reuse the key, definite answers retire it) |
 | `test_idempotency.py` (8) | Run once and replay, key reuse, per-operation scope, failed requests not remembered, a retry racing the original, a key purged mid-claim, batched purge |
 | `test_maintenance.py` (5) | The background job: drains a backlog of overdue holds in one run, forgets keys past the replay window, survives a failed run, stops promptly on shutdown |
 | `test_observability.py` (9) | Request IDs generated, echoed or replaced, and quoted in errors; one JSON access line per request; latency per route template; errors by code; lock waits; retried transactions; the client and key in the access log |
 | `test_reconciliation.py` (10) | Damages the ledger past every trigger (replica mode) and checks each kind of damage is reported; capped lists with exact totals; one consistent snapshot while transfers commit; an entry crossing into another client's books |
-| `test_migrations.py` (11) | Ordered, idempotent migrations; valid concurrent indexes; the hot queries use them; four instances migrating at once without deadlocking; edited migrations refused |
+| `test_migrations.py` (10) | Ordered, idempotent migrations; valid concurrent indexes; the hot queries use them; four instances migrating at once without deadlocking; edited migrations refused |
 | `test_db.py` (8), `test_config.py` (11) | Commit/rollback, deadlock retries in fresh transactions, lock timeouts, replacing dropped connections, idle-only pings; config parsing, validation and password redaction |
 | `test_invariants.py` | **Model-based testing**: Hypothesis generates 40 random sequences (500 with the `thorough` profile) of up to 30 operations (deposits, transfers, holds, captures, voids, reversals). After *every* step it checks that reconciliation is clean, the database matches an in-memory model balance for balance, and no protected account is overdrawn |
 
@@ -469,8 +489,9 @@ migrations/003_*, 004_*     hardening: TRUNCATE guard, fixed account identity, h
 migrations/005_*            balances and held amounts maintained by triggers; direct writes refused
 migrations/006_*, 007_*     API clients, keys, the audit log; tenant foreign keys added without blocking writes
 migrations/008_*            the outbox: an event per change, written by triggers in the same transaction
+migrations/009_*            payments to hot accounts: holds with a destination, settled in batches
 src/tally/
-├── ledger.py               validation, ordered row locks, posting, holds, reversals, statements; one client's books
+├── ledger.py               validation, ordered row locks, posting, holds, reversals, statements, batched settlement
 ├── auth.py                 API clients and keys (hashed), and who is acting
 ├── events.py               reading the outbox in commit-safe order, and purging it
 ├── idempotency.py          idempotency keys in the same transaction as the operation
@@ -488,9 +509,10 @@ requirements.txt            exact runtime versions for the image and CI (Dependa
 ## Not built (yet)
 
 - **FX between currencies.** Each currency balances on its own; a conversion would post through FX accounts with a rate.
-- **Authentication and multi-tenancy.** This is meant to run as an internal service behind a gateway. Per-tenant isolation would add a `tenant_id` to every table and use row-level security.
+- **Row-level security** as a third layer of tenant isolation, under the ledger's filters and the composite foreign keys: `SET LOCAL` the client per transaction and let Postgres hide other clients' rows even from a forgotten `WHERE`. It needs a non-superuser application role and care with the triggers that write across clients (settlement, expiry).
 - **Scale for very long histories:** partition `entries` by month, archive old partitions, and snapshot balances so point-in-time queries don't touch cold data.
-- **Downstream events:** publish `transaction.posted` events through a transactional outbox, so other services learn about money movement without dual writes.
+- **Pushing events out.** Consumers poll `/v1/events`; a relay forwarding the outbox to Kafka, or signed webhooks with retries, would read the same table with the same watermark.
+- **Settlement status in one place.** A batched payment's state is its hold's (`active` until settled, then `captured` with the settlement transaction); a backlog gauge would need Prometheus' multiprocess gauge mode.
 
 ## License
 
