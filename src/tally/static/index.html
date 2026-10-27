@@ -9,6 +9,7 @@
 <body>
   <header class="topbar">
     <div class="brand"><span class="logo">◆</span> Tally <span class="tag">double-entry ledger</span></div>
+    <button id="change-key" class="small" type="button">API key</button>
     <button id="recon" class="recon" type="button" title="Re-derives every balance from the raw entries; click to check again">Checking the books…</button>
   </header>
   <div id="offline" class="offline" role="alert" hidden></div>
@@ -120,6 +121,16 @@
   <dialog id="account-dialog">
     <div id="account-detail"></div>
     <div class="row end"><button id="close-dialog">Close</button></div>
+  </dialog>
+
+  <dialog id="key-dialog">
+    <form id="key-form" method="dialog">
+      <h2>API key</h2>
+      <p class="hint">The console calls the API like any other client, so it needs a key: the one <code>tally demo</code>
+        printed, or one from <code>tally create-client &lt;name&gt;</code>. It is kept in this tab only.</p>
+      <label>Key <input name="key" required autocomplete="off" spellcheck="false" placeholder="tly_..."></label>
+      <button class="primary" type="submit">Use this key</button>
+    </form>
   </dialog>
 
   <div id="toasts" aria-live="polite"></div>

@@ -144,6 +144,38 @@ the index builder held the lock they were waiting for. Postgres reported a deadl
 runner now polls with `pg_try_advisory_lock()`, and
 `test_instances_starting_at_the_same_time_migrate_once_without_deadlocking` reproduces the race.
 
+## Clients and tenancy
+
+Every request authenticates with an API key, and the key decides whose books it sees. Each account, transaction
+and hold belongs to one client; another client's look exactly like ones that don't exist (`404`, never `403`, so
+ids leak nothing).
+
+- **Keys.** `tally create-client NAME` prints a key once (`tly_` plus 256 random bits); only its SHA-256 is stored.
+  A fast hash is the right choice here: the key is random rather than a password, so there is nothing to brute
+  force, and every request can afford the lookup. A client can hold several keys, which is how a key is rotated
+  without downtime (`create-key`, move callers over, `revoke-key`). Revocation takes effect on the next request.
+- **Isolation in code and in the database.** The ledger filters every query by client, and an unknown client fails
+  closed (the lookup finds nothing, an insert fails). The database enforces the same boundary the way it enforces
+  currencies: composite foreign keys `(client_id, account_id)` and `(client_id, transaction_id)` make it impossible
+  for a transaction to touch another client's account, whatever the code does. Entries and holds take their client
+  from their transaction and account (triggers), so it can't be faked either. On an existing ledger the keys were
+  added without blocking writes: indexes `CONCURRENTLY`, foreign keys `NOT VALID` and then validated.
+- **Idempotency keys are per client**, so two clients may pick the same one.
+- **Audit log.** Every change (account opened, transaction posted or reversed, hold created, captured, voided or
+  expired) gets an append-only `audit_log` row naming the client, the API key and the request id. Triggers write it,
+  inside the statement that makes the change: a committed change always has its record, a rolled-back one never
+  does, and no new code path can forget it. The API tells the database who is acting with `set_config(...)` local
+  to the transaction, in the same query that checks the key. Changes made any other way (psql, a script, the expiry
+  job) are recorded with no key, which are exactly the rows worth a second look.
+- **Reconciliation** over HTTP covers only the caller's books; `tally reconcile` checks everything, including that no
+  entry or hold ever crossed from one client's books into another's.
+
+**What it cost.** The first version checked the key in its own transaction and wrote the audit row from the
+application: about 20% of transfer throughput, an extra pool checkout and an extra round trip, the second one while
+holding the account locks. Checking the key inside the request's own transaction and writing the audit row from a
+trigger brought the cost down to roughly 6% on the hot-account scenario and 7-16% on spread traffic (measured A/B
+against the previous commit on the same machine; run-to-run noise here is about 10%).
+
 ## Concurrency
 
 Every operation locks the account rows it touches with `SELECT ... FOR UPDATE`, **always in ascending
@@ -174,8 +206,8 @@ can be retried with the same key once the account is topped up.
 Keys are remembered for 24 hours. A background job deletes expired ones in batches of 5,000. One big `DELETE`
 would be all or nothing: Postgres deleted about 1.7M keys per second here, so with a 30-second statement timeout
 a backlog of roughly 50M keys (about 14 hours of traffic at 1,000 transfers/s) would time out, roll back, and
-fail identically on every later run. Keys are global per operation for now. Tally has no separate API clients
-yet; when it does, the client id must become part of the key so one client can never replay another's response.
+fail identically on every later run. Keys are per client (the client id is part of the stored key), so two
+clients can pick the same key and neither can ever replay the other's response.
 
 ## Reconciliation
 
@@ -222,6 +254,8 @@ in a separate counter and fold it into the ledger periodically. Each one gives u
 per-transaction consistency on that one account.
 
 ## API
+
+Every `/v1` route needs an API key: `Authorization: Bearer tly_...`. See [Clients and tenancy](#clients-and-tenancy).
 
 | Method | Path | |
 |---|---|---|
@@ -310,8 +344,8 @@ of them whichever worker answers (checked: 20 requests spread over 2 workers rea
 
 ```bash
 docker compose up --build -d --wait    # returns once the app's health check passes
-docker compose exec app tally demo     # sample accounts and transactions
-open http://localhost:8000             # the console; API docs at /docs
+docker compose exec app tally demo     # sample data, and prints the demo client's API key
+open http://localhost:8000             # the console (paste the key); API docs at /docs
 ```
 
 Ports are published on `127.0.0.1` only (the database password is `tally`); if 8000 or 5432 is taken, set
@@ -326,6 +360,7 @@ python -m venv .venv && source .venv/bin/activate && pip install -r requirements
 export TALLY_DATABASE_URL=postgresql://user:pass@localhost:5432/tally
 tally migrate && tally demo && tally serve
 tally reconcile                        # exit code 1 if anything disagrees
+tally create-client acme               # prints acme's first API key; also create-key, revoke-key, list-keys
 ```
 
 Exit codes are meant for schedulers: `0` done, `1` reconciliation found discrepancies, `2` the command couldn't
@@ -364,23 +399,24 @@ node --test 'tests/js/*.test.js'   # the console's money and idempotency logic (
 # export DOCKER_HOST=unix://$HOME/.docker/run/docker.sock
 ```
 
-181 Python tests, all against a real PostgreSQL because the rules under test live in the database, plus 11 for the console's JavaScript. Branch coverage is 98%; warnings fail the run.
+206 Python tests, all against a real PostgreSQL because the rules under test live in the database, plus 11 for the console's JavaScript. Branch coverage is 98%; warnings fail the run.
 
 | Suite | What it covers |
 |---|---|
 | `test_transactions.py` (24) | Deposits, multi-leg fees, per-currency balancing, overdrafts, reversals, statements, point-in-time balances, leg validation, entry-by-entry overdraft checks, single-entry posts, 404s for unknown transactions and holds |
 | `test_holds.py` (13) | Authorize, partial capture, void, expiry in bounded batches, capture on debit-normal accounts, double settlement, capturing the last of the funds, capturing into the held account, expiry and amount validation |
-| `test_database_invariants.py` (30) | **Raw SQL that bypasses the app** to try to break each rule, and gets rejected |
+| `test_database_invariants.py` (34) | **Raw SQL that bypasses the app** to try to break each rule, and gets rejected; a transaction touching another client's account, a forged entry client, an account changing owner, an editable audit log |
 | `test_concurrency.py` (4) | 50 threads draining one account, opposite-direction transfers, one idempotency key from 20 threads, concurrent reversals. Each race gets its own pool, filled first, so all 60 transactions really run at once, and fails if any transaction was retried, so a deadlock can't hide behind `db.run`'s retries |
 | `test_api.py` (9) | HTTP contract, idempotent replay, key reuse, problem details, pagination, holds, reconciliation |
 | `test_api_errors.py` (22) | A real row lock becomes `503 LOCK_TIMEOUT`; timeouts, pool exhaustion and outages become 503s; constraint names and crashes don't leak; oversized and chunked bodies get 413; naive timestamps and forged cursors are rejected; paging 120 holds that share one timestamp; optional idempotency; `Location` headers; error codes that don't depend on the Python version |
-| `test_cli.py` (16) | Exit codes (0 / 1 for discrepancies / 2 for a database that's down, unmigrated or edited), fast failure without a pool timeout, demo refusing a non-empty ledger, rolling back when it fails halfway, two demos at once seeding once, argument and config validation, Ctrl-C |
+| `test_tenancy.py` (13) | Missing, malformed, unknown and revoked keys get `401`; key rotation; only a hash stored; another client's accounts, transactions and holds are `404` for every read and write and no money moves; idempotency keys per client; reconciliation per client; audit rows naming key and request, none for replays or failures, keyless rows for changes made around the API |
+| `test_cli.py` (21) | Exit codes (0 / 1 for discrepancies / 2 for a database that's down, unmigrated or edited), fast failure without a pool timeout, demo refusing a non-empty ledger, rolling back when it fails halfway, two demos at once seeding once, argument and config validation, Ctrl-C; API keys: only the key on stdout, revoke and list, unknown clients and keys, taken names |
 | `test_console.py` (3), `tests/js/` (11) | The console's CSP and cache revalidation; exact money parsing and formatting per currency; one idempotency key per intent (double clicks send one request, retries reuse the key, definite answers retire it) |
 | `test_idempotency.py` (8) | Run once and replay, key reuse, per-operation scope, failed requests not remembered, a retry racing the original, a key purged mid-claim, batched purge |
 | `test_maintenance.py` (5) | The background job: drains a backlog of overdue holds in one run, forgets keys past the replay window, survives a failed run, stops promptly on shutdown |
-| `test_observability.py` (8) | Request IDs generated, echoed or replaced, and quoted in errors; one JSON access line per request; latency per route template; errors by code; lock waits; retried transactions |
-| `test_reconciliation.py` (9) | Damages the ledger past every trigger (replica mode) and checks each kind of damage is reported; capped lists with exact totals; one consistent snapshot while transfers commit |
-| `test_migrations.py` (10) | Ordered, idempotent migrations; valid concurrent indexes; the hot queries use them; four instances migrating at once without deadlocking; edited migrations refused |
+| `test_observability.py` (9) | Request IDs generated, echoed or replaced, and quoted in errors; one JSON access line per request; latency per route template; errors by code; lock waits; retried transactions; the client and key in the access log |
+| `test_reconciliation.py` (10) | Damages the ledger past every trigger (replica mode) and checks each kind of damage is reported; capped lists with exact totals; one consistent snapshot while transfers commit; an entry crossing into another client's books |
+| `test_migrations.py` (11) | Ordered, idempotent migrations; valid concurrent indexes; the hot queries use them; four instances migrating at once without deadlocking; edited migrations refused |
 | `test_db.py` (8), `test_config.py` (11) | Commit/rollback, deadlock retries in fresh transactions, lock timeouts, replacing dropped connections, idle-only pings; config parsing, validation and password redaction |
 | `test_invariants.py` | **Model-based testing**: Hypothesis generates 40 random sequences (500 with the `thorough` profile) of up to 30 operations (deposits, transfers, holds, captures, voids, reversals). After *every* step it checks that reconciliation is clean, the database matches an in-memory model balance for balance, and no protected account is overdrawn |
 
@@ -409,14 +445,16 @@ migrations/002_*.sql        indexes for the slow queries, built CONCURRENTLY
 migrations/003_*, 004_*     hardening: TRUNCATE guard, fixed account identity, hold lifecycle,
                             DB-stamped timestamps, metadata CHECKs (added NOT VALID, then validated)
 migrations/005_*            balances and held amounts maintained by triggers; direct writes refused
+migrations/006_*, 007_*     API clients, keys, the audit log; tenant foreign keys added without blocking writes
 src/tally/
-├── ledger.py               validation, ordered row locks, posting, holds, reversals, statements
+├── ledger.py               validation, ordered row locks, posting, holds, reversals, statements; one client's books
+├── auth.py                 API clients and keys (hashed), and who is acting
 ├── idempotency.py          idempotency keys in the same transaction as the operation
 ├── reconciliation.py       re-checks every trigger-enforced rule in one REPEATABLE READ snapshot
 ├── db.py                   connection pool with timeouts and idle checks, deadlock retry, migration runner
 ├── api.py, schemas.py      FastAPI routes, Pydantic models, RFC 9457 errors
 ├── observability.py        request IDs, JSON logs, Prometheus metrics (summed across worker processes)
-├── cli.py                  tally migrate | serve | reconcile | demo
+├── cli.py                  tally migrate | serve | reconcile | demo | create-client | create-key | revoke-key | list-keys
 └── static/                 the console (plain JS modules, no build step)
 scripts/load_test.py        concurrent load test: answers, reconciliation, conservation; exits 1 on any failure
 scripts/index_benchmark.py  EXPLAIN ANALYZE before/after migration 002 on 2M entries (refuses non-bench databases)

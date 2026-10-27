@@ -17,6 +17,7 @@ class SmallBatches(Ledger):
     calls: list[int]
 
     def __init__(self) -> None:
+        super().__init__()  # no client: expiry is global
         self.calls = []
 
     def expire_holds(self, conn, limit: int = 2) -> int:

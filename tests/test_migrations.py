@@ -7,7 +7,13 @@ import pytest
 
 from tally.db import MigrationError, _migration_files, _statements, migrate
 
-INDEXES = ("entries_by_account_time", "transactions_by_posted_at")
+# Built CONCURRENTLY (migrations 002 and 007), so they could be left INVALID by a failed build.
+INDEXES = (
+    "accounts_client_id_key",
+    "entries_by_account_time",
+    "transactions_by_client_time",
+    "transactions_client_id_key",
+)
 ALL_VERSIONS = [version for version, _ in _migration_files()]
 
 
@@ -54,14 +60,20 @@ def test_concurrently_built_indexes_exist_and_are_valid(migrated):
             "ORDER BY posted_at DESC, id DESC LIMIT 1",
             "entries_by_account_time",
         ),
-        ("SELECT id FROM transactions ORDER BY posted_at DESC, id DESC LIMIT 20", "transactions_by_posted_at"),
+        (
+            "SELECT id FROM transactions WHERE client_id = 1 ORDER BY posted_at DESC, id DESC LIMIT 20",
+            "transactions_by_client_time",
+        ),
+        ("SELECT id FROM accounts WHERE client_id = 1 AND id > 0 ORDER BY id LIMIT 50", "accounts_client_id_key"),
     ],
 )
 def test_hot_queries_can_use_their_index(migrated, query, index):
-    # On a near-empty table a sequential scan is cheaper, so take that option away
-    # and check that the index fits the query's shape (filter and sort order).
+    # On a near-empty table a sequential scan (or a bitmap scan plus a sort) is cheaper,
+    # so take those options away and check that the index fits the query's shape:
+    # filter and sort order, read in index order with no Sort step.
     with psycopg.connect(migrated) as conn:
         conn.execute("SET enable_seqscan = off")
+        conn.execute("SET enable_bitmapscan = off")
         plan = "\n".join(row[0] for row in conn.execute(f"EXPLAIN {query}"))
     assert index in plan
     assert "Sort" not in plan

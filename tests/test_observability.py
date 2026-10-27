@@ -96,3 +96,14 @@ def test_retried_transactions_are_counted(db):
     db.run(deadlocks_once)
 
     assert sample("tally_db_retries_total", error="DeadlockDetected") == before + 1
+
+
+def test_the_access_log_names_the_client_and_key(client, caplog, db, api_key):
+    from tally import auth
+
+    with caplog.at_level(logging.INFO, logger="tally.access"):
+        client.get("/v1/accounts")
+
+    (record,) = [r for r in caplog.records if r.name == "tally.access"]
+    actor = db.run(lambda conn: auth.find_key(conn, api_key))
+    assert (record.client_id, record.api_key_id) == (actor.client_id, actor.key_id)

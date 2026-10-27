@@ -52,6 +52,10 @@ code, .mono { font-family: var(--mono); font-size: 12px; }
 .recon.ok { background: var(--ok-soft); color: var(--ok); }
 .recon.bad { background: var(--bad-soft); color: var(--bad); }
 .recon { border: 0; font-family: inherit; cursor: pointer; }
+#change-key { margin-left: auto; }
+#change-key + .recon { margin-left: 0; }
+#key-dialog { width: min(520px, 94vw); }
+#key-dialog h2 { margin-bottom: 8px; }
 .recon.checking { opacity: .65; }
 .offline { position: sticky; top: 57px; z-index: 4; padding: 8px 24px; text-align: center; font-size: 13px; font-weight: 600; background: var(--bad-soft); color: var(--bad); border-bottom: 1px solid var(--border); }
 

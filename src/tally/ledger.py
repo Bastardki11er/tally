@@ -10,6 +10,12 @@ entry moves the account's balance and fills in balance_after, and creating or
 settling a hold moves the account's held amount. The checks here exist to fail
 early with a precise error; the database enforces the same rules regardless.
 
+Tenancy: a Ledger is bound to one API client and only ever sees that client's books.
+Another client's account looks exactly like one that doesn't exist (404, not 403), so
+ids leak nothing. ``Ledger()`` without a client is for global maintenance only (hold
+expiry); any lookup it makes finds nothing and any insert fails, so forgetting the
+client fails closed. The database enforces the same boundary (migrations 006 and 007).
+
 Concurrency: every operation locks the account rows it touches with
 ``SELECT ... FOR UPDATE``, always in ascending id order. Two transfers between
 the same accounts in opposite directions therefore queue up instead of
@@ -72,6 +78,9 @@ def opposite(direction: str) -> Direction:
 
 
 class Ledger:
+    def __init__(self, client_id: int | None = None) -> None:
+        self.client_id = client_id
+
     # --- accounts -----------------------------------------------------------------
 
     def create_account(
@@ -84,21 +93,23 @@ class Ledger:
         metadata: dict | None = None,
     ) -> dict:
         return conn.execute(
-            f"INSERT INTO accounts (name, type, currency, allow_negative, metadata) VALUES (%s, %s, %s, %s, %s) "
-            f"RETURNING {ACCOUNT_COLUMNS}",
-            (name, type, currency, allow_negative, Jsonb(metadata or {})),
+            f"INSERT INTO accounts (client_id, name, type, currency, allow_negative, metadata) "
+            f"VALUES (%s, %s, %s, %s, %s, %s) RETURNING {ACCOUNT_COLUMNS}",
+            (self.client_id, name, type, currency, allow_negative, Jsonb(metadata or {})),
         ).fetchone()
 
     def get_account(self, conn: Connection, account_id: int) -> dict:
-        account = conn.execute(f"SELECT {ACCOUNT_COLUMNS} FROM accounts WHERE id = %s", (account_id,)).fetchone()
+        account = conn.execute(
+            f"SELECT {ACCOUNT_COLUMNS} FROM accounts WHERE id = %s AND client_id = %s", (account_id, self.client_id)
+        ).fetchone()
         if account is None:
             raise not_found("ACCOUNT_NOT_FOUND", f"Account {account_id} does not exist")
         return account
 
     def list_accounts(self, conn: Connection, limit: int = 50, after_id: int | None = None) -> list[dict]:
         return conn.execute(
-            f"SELECT {ACCOUNT_COLUMNS} FROM accounts WHERE id > %s ORDER BY id LIMIT %s",
-            (after_id or 0, limit),
+            f"SELECT {ACCOUNT_COLUMNS} FROM accounts WHERE client_id = %s AND id > %s ORDER BY id LIMIT %s",
+            (self.client_id, after_id or 0, limit),
         ).fetchall()
 
     # --- posting ------------------------------------------------------------------
@@ -139,7 +150,8 @@ class Ledger:
         # wait on the account locks, and then fail with a misleading INSUFFICIENT_FUNDS
         # (the money having just been moved back) instead of ALREADY_REVERSED.
         original = conn.execute(
-            "SELECT id, reverses_id FROM transactions WHERE id = %s FOR UPDATE", (transaction_id,)
+            "SELECT id, reverses_id FROM transactions WHERE id = %s AND client_id = %s FOR UPDATE",
+            (transaction_id, self.client_id),
         ).fetchone()
         if original is None:
             raise not_found("TRANSACTION_NOT_FOUND", f"Transaction {transaction_id} does not exist")
@@ -240,12 +252,14 @@ class Ledger:
             return 0
         # The trigger releasing each hold updates its account. Take those row locks first,
         # in id order like every other path, rather than in whatever order holds expire.
-        self._lock_accounts(conn, {hold["account_id"] for hold in expired})
+        self._lock_accounts(conn, {hold["account_id"] for hold in expired}, any_client=True)
         conn.execute("UPDATE holds SET status = 'expired' WHERE id = ANY(%s)", ([h["id"] for h in expired],))
         return len(expired)
 
     def get_hold(self, conn: Connection, hold_id: UUID) -> dict:
-        hold = conn.execute(f"SELECT {HOLD_COLUMNS} FROM holds WHERE id = %s", (hold_id,)).fetchone()
+        hold = conn.execute(
+            f"SELECT {HOLD_COLUMNS} FROM holds WHERE id = %s AND client_id = %s", (hold_id, self.client_id)
+        ).fetchone()
         if hold is None:
             raise not_found("HOLD_NOT_FOUND", f"Hold {hold_id} does not exist")
         return hold
@@ -271,7 +285,8 @@ class Ledger:
 
     def get_transaction(self, conn: Connection, transaction_id: UUID) -> dict:
         transaction = conn.execute(
-            f"SELECT {TRANSACTION_COLUMNS} FROM transactions WHERE id = %s", (transaction_id,)
+            f"SELECT {TRANSACTION_COLUMNS} FROM transactions WHERE id = %s AND client_id = %s",
+            (transaction_id, self.client_id),
         ).fetchone()
         if transaction is None:
             raise not_found("TRANSACTION_NOT_FOUND", f"Transaction {transaction_id} does not exist")
@@ -287,16 +302,17 @@ class Ledger:
         """The latest transactions with their entries, two queries per page.
 
         ``before`` is the (posted_at, id) of the last transaction seen. The row comparison
-        walks the (posted_at, id) index backwards from there, however deep the page.
+        walks the (client_id, posted_at, id) index backwards from there, however deep the page.
         """
-        after_cursor = "WHERE (t.posted_at, t.id) < (%s, %s)" if before else ""
+        after_cursor = "AND (t.posted_at, t.id) < (%s, %s)" if before else ""
         transactions = conn.execute(
             f"""
             SELECT {TRANSACTION_COLUMNS}, (SELECT r.id FROM transactions r WHERE r.reverses_id = t.id) AS reversed_by
-              FROM transactions t {after_cursor}
+              FROM transactions t
+             WHERE t.client_id = %s {after_cursor}
              ORDER BY t.posted_at DESC, t.id DESC LIMIT %s
             """,
-            (*(before or ()), limit),
+            (self.client_id, *(before or ()), limit),
         ).fetchall()
         entries = conn.execute(
             f"SELECT transaction_id, {ENTRY_COLUMNS} FROM entries WHERE transaction_id = ANY(%s) ORDER BY id",
@@ -376,9 +392,9 @@ class Ledger:
         self, conn: Connection, description: str, metadata: dict | None, reverses_id: UUID | None = None
     ) -> dict:
         return conn.execute(
-            f"INSERT INTO transactions (description, metadata, reverses_id) VALUES (%s, %s, %s) "
+            f"INSERT INTO transactions (client_id, description, metadata, reverses_id) VALUES (%s, %s, %s, %s) "
             f"RETURNING {TRANSACTION_COLUMNS}",
-            (description, Jsonb(metadata or {}), reverses_id),
+            (self.client_id, description, Jsonb(metadata or {}), reverses_id),
         ).fetchone()
 
     def _insert_entries(
@@ -405,13 +421,17 @@ class Ledger:
         ).fetchall()
         return {**transaction, "entries": sorted(entries, key=lambda e: e["id"])}
 
-    def _lock_accounts(self, conn: Connection, account_ids: set[int]) -> dict[int, dict[str, Any]]:
+    def _lock_accounts(
+        self, conn: Connection, account_ids: set[int], any_client: bool = False
+    ) -> dict[int, dict[str, Any]]:
         # ORDER BY id + FOR UPDATE takes the row locks in ascending id order, the same
-        # order in every code path, which is what rules out deadlocks.
+        # order in every code path, which is what rules out deadlocks. Only global
+        # maintenance (any_client) may lock accounts outside the ledger's own client.
         with LOCK_WAIT_SECONDS.time():
             rows = conn.execute(
-                f"SELECT {ACCOUNT_COLUMNS} FROM accounts WHERE id = ANY(%s) ORDER BY id FOR UPDATE",
-                (sorted(account_ids),),
+                f"SELECT {ACCOUNT_COLUMNS} FROM accounts WHERE id = ANY(%s) AND (%s OR client_id = %s) "
+                f"ORDER BY id FOR UPDATE",
+                (sorted(account_ids), any_client, self.client_id),
             ).fetchall()
         found = {row["id"]: row for row in rows}
         missing = sorted(account_ids - found.keys())
@@ -421,8 +441,9 @@ class Ledger:
 
     def _lock_active_hold(self, conn: Connection, hold_id: UUID) -> dict:
         hold = conn.execute(
-            f"SELECT {HOLD_COLUMNS}, expires_at <= now() AS is_expired FROM holds WHERE id = %s FOR UPDATE",
-            (hold_id,),
+            f"SELECT {HOLD_COLUMNS}, expires_at <= now() AS is_expired FROM holds "
+            f"WHERE id = %s AND client_id = %s FOR UPDATE",
+            (hold_id, self.client_id),
         ).fetchone()
         if hold is None:
             raise not_found("HOLD_NOT_FOUND", f"Hold {hold_id} does not exist")

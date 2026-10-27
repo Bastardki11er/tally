@@ -13,13 +13,15 @@ from tally.config import Settings
 from tally.ledger import Ledger
 from tally.schemas import MAX_METADATA_BYTES
 
+from .conftest import DEFAULT_CLIENT
+
 
 def key() -> dict:
     return {"Idempotency-Key": str(uuid.uuid4())}
 
 
 @pytest.fixture
-def make_client(migrated):
+def make_client(migrated, api_key):
     """Clients with custom settings, or that turn server exceptions into responses like production does."""
     clients = []
 
@@ -27,7 +29,9 @@ def make_client(migrated):
         app = create_app(
             Settings(database_url=migrated, pool_size=5, **settings), run_migrations=False, maintenance=False
         )
-        client = TestClient(app, raise_server_exceptions=raise_server_exceptions)
+        client = TestClient(
+            app, raise_server_exceptions=raise_server_exceptions, headers={"Authorization": f"Bearer {api_key}"}
+        )
         clients.append(client.__enter__())
         return client
 
@@ -177,7 +181,7 @@ def test_holds_page_past_the_first_page_even_when_they_share_a_timestamp(client,
     alice = wallet("alice", funded=1_000)
     expires = datetime.now(UTC) + timedelta(days=1)
     # One transaction, so all 120 holds get the same created_at; only the id breaks ties.
-    db.run(lambda conn: [Ledger().create_hold(conn, alice["id"], 1, expires) for _ in range(120)])
+    db.run(lambda conn: [Ledger(DEFAULT_CLIENT).create_hold(conn, alice["id"], 1, expires) for _ in range(120)])
 
     pages = walk(client, f"/v1/accounts/{alice['id']}/holds", limit=50)
 
@@ -187,7 +191,7 @@ def test_holds_page_past_the_first_page_even_when_they_share_a_timestamp(client,
 
 def test_the_transaction_feed_pages_through_everything_once(client, db, wallet, cash):
     alice = wallet("alice", funded=1_000)
-    db.run(lambda conn: [Ledger().transfer(conn, alice["id"], cash["id"], 1) for _ in range(25)])
+    db.run(lambda conn: [Ledger(DEFAULT_CLIENT).transfer(conn, alice["id"], cash["id"], 1) for _ in range(25)])
 
     pages = walk(client, "/v1/transactions", limit=10)
 

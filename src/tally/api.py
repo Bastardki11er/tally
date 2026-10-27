@@ -1,5 +1,10 @@
 """HTTP API.
 
+Every /v1 route needs an API key (``Authorization: Bearer <key>``). The key decides
+whose books the request sees: another client's accounts, transactions and holds look
+exactly like ones that don't exist. Every change is recorded in the audit log, in the
+same database transaction as the change itself (by triggers, migration 006).
+
 Money-moving endpoints require an ``Idempotency-Key`` header; creating accounts and
 voiding holds accept one. Repeating a request with the same key returns the original
 response (with ``Idempotent-Replayed: true``) instead of doing the work again.
@@ -25,16 +30,17 @@ from uuid import UUID
 
 import psycopg
 import psycopg_pool
-from fastapi import FastAPI, Header, Query, Request
+from fastapi import APIRouter, Depends, FastAPI, Header, Query, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
 from prometheus_client import CONTENT_TYPE_LATEST
 from pydantic import AwareDatetime
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from . import __version__, idempotency
+from . import __version__, auth, idempotency
 from .config import Settings
 from .db import Database, migrate
 from .errors import LedgerError, unprocessable
@@ -91,6 +97,18 @@ OptionalIdempotencyKey = Annotated[
 # these names from the module's globals.
 Limit = Annotated[int, Query(ge=1, le=200)]
 Cursor = Annotated[str | None, Query(max_length=200, description="next_cursor from the previous page")]
+
+bearer = HTTPBearer(auto_error=False, description="An API key from `tally create-client` or `tally create-key`")
+
+
+def require_key(request: Request, credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer)]) -> None:
+    """Takes the key from the request. It is checked inside the request's own database
+    transaction (see ``run`` in create_app): a separate lookup would cost every request
+    another pool checkout and transaction, measured at about a fifth of throughput."""
+    if credentials is None:
+        raise LedgerError(401, "UNAUTHENTICATED", "Send an API key: Authorization: Bearer <key>")
+    request.state.api_key = credentials.credentials
+
 
 # Failures a retry can fix, as (code, message, seconds to wait). Matched by exception
 # class, most specific first, so a lock timeout isn't reported as "database down".
@@ -240,12 +258,12 @@ def create_app(settings: Settings | None = None, *, run_migrations: bool = True,
             statement_timeout_ms=settings.statement_timeout_ms,
         )
         app.state.db = db
-        app.state.ledger = Ledger()
         stop = threading.Event()
         if maintenance:
             threading.Thread(
                 target=_maintenance_loop,
-                args=(db, app.state.ledger, settings.maintenance_interval_seconds, stop),
+                # No client: expiry sweeps every client's holds.
+                args=(db, Ledger(), settings.maintenance_interval_seconds, stop),
                 daemon=True,
                 name="tally-maintenance",
             ).start()
@@ -268,7 +286,8 @@ def create_app(settings: Settings | None = None, *, run_migrations: bool = True,
 
     @app.exception_handler(LedgerError)
     async def ledger_error(request: Request, exc: LedgerError) -> JSONResponse:
-        return problem(exc.status, exc.code, exc.message)
+        headers = {"WWW-Authenticate": "Bearer"} if exc.status == 401 else None
+        return problem(exc.status, exc.code, exc.message, headers=headers)
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
@@ -302,14 +321,32 @@ def create_app(settings: Settings | None = None, *, run_migrations: bool = True,
         return request.app.state.db
 
     def ledger(request: Request) -> Ledger:
-        return request.app.state.ledger
+        return Ledger(request.state.actor.client_id)
+
+    def scoped(request: Request, operation: str) -> str:
+        # Idempotency keys are per client: two clients may pick the same key.
+        return f"{request.state.actor.client_id}:{operation}"
+
+    def run(request: Request, work):
+        """Runs ``work(conn)`` in one transaction, after checking the request's key in that same transaction."""
+
+        def authenticated(conn):
+            actor = auth.find_key(conn, request.state.api_key, request_id.get())
+            if actor is None:
+                raise LedgerError(401, "UNAUTHENTICATED", "Unknown or revoked API key")
+            request.state.actor = actor
+            return work(conn)
+
+        return db(request).run(authenticated)
+
+    v1 = APIRouter(prefix="/v1", dependencies=[Depends(require_key)])
 
     def page(rows: list[dict], limit: int, key: Callable[[dict], tuple]) -> dict:
         return {"data": rows, "next_cursor": encode_cursor(*key(rows[-1])) if len(rows) == limit else None}
 
     # --- accounts -----------------------------------------------------------------
 
-    @app.post("/v1/accounts", status_code=201, response_model=AccountOut, tags=["accounts"])
+    @v1.post("/accounts", status_code=201, response_model=AccountOut, tags=["accounts"])
     def create_account(body: AccountIn, request: Request, key: OptionalIdempotencyKey = None):
         def create(conn):
             return ledger(request).create_account(conn, **body.model_dump())
@@ -317,29 +354,30 @@ def create_app(settings: Settings | None = None, *, run_migrations: bool = True,
         def work(conn):
             if key is None:
                 return Outcome(201, jsonable_encoder(create(conn)), replayed=False)
-            return run_idempotent(conn, "accounts", key, body, lambda: create(conn))
+            return run_idempotent(conn, scoped(request, "accounts"), key, body, lambda: create(conn))
 
-        return respond(db(request).run(work), location=lambda account: f"/v1/accounts/{account['id']}")
+        outcome = run(request, work)
+        return respond(outcome, location=lambda account: f"/v1/accounts/{account['id']}")
 
-    @app.get("/v1/accounts", response_model=Page[AccountOut], tags=["accounts"])
+    @v1.get("/accounts", response_model=Page[AccountOut], tags=["accounts"])
     def list_accounts(request: Request, limit: Limit = 50, cursor: Cursor = None):
         after = decode_cursor(cursor, int)
-        rows = db(request).run(lambda conn: ledger(request).list_accounts(conn, limit, after[0] if after else None))
+        rows = run(request, lambda conn: ledger(request).list_accounts(conn, limit, after[0] if after else None))
         return page(rows, limit, key=lambda account: (account["id"],))
 
-    @app.get("/v1/accounts/{account_id}", response_model=AccountOut, tags=["accounts"])
+    @v1.get("/accounts/{account_id}", response_model=AccountOut, tags=["accounts"])
     def get_account(account_id: int, request: Request):
-        return db(request).run(lambda conn: ledger(request).get_account(conn, account_id))
+        return run(request, lambda conn: ledger(request).get_account(conn, account_id))
 
-    @app.get("/v1/accounts/{account_id}/entries", response_model=Page[StatementLine], tags=["accounts"])
+    @v1.get("/accounts/{account_id}/entries", response_model=Page[StatementLine], tags=["accounts"])
     def statement(account_id: int, request: Request, limit: Limit = 50, cursor: Cursor = None):
         before = decode_cursor(cursor, int)
-        rows = db(request).run(
-            lambda conn: ledger(request).statement(conn, account_id, limit, before[0] if before else None)
+        rows = run(
+            request, lambda conn: ledger(request).statement(conn, account_id, limit, before[0] if before else None)
         )
         return page(rows, limit, key=lambda entry: (entry["id"],))
 
-    @app.get("/v1/accounts/{account_id}/balance", response_model=BalanceOut, tags=["accounts"])
+    @v1.get("/accounts/{account_id}/balance", response_model=BalanceOut, tags=["accounts"])
     def balance_at(
         account_id: int,
         request: Request,
@@ -348,10 +386,10 @@ def create_app(settings: Settings | None = None, *, run_migrations: bool = True,
         as_of: Annotated[AwareDatetime | None, Query(description="ISO 8601 with a time zone; defaults to now")] = None,
     ):
         moment = as_of or datetime.now(UTC)
-        balance = db(request).run(lambda conn: ledger(request).balance_at(conn, account_id, moment))
+        balance = run(request, lambda conn: ledger(request).balance_at(conn, account_id, moment))
         return {"account_id": account_id, "as_of": moment, "balance": balance}
 
-    @app.get("/v1/accounts/{account_id}/holds", response_model=Page[HoldOut], tags=["holds"])
+    @v1.get("/accounts/{account_id}/holds", response_model=Page[HoldOut], tags=["holds"])
     def account_holds(
         account_id: int,
         request: Request,
@@ -360,7 +398,7 @@ def create_app(settings: Settings | None = None, *, run_migrations: bool = True,
         cursor: Cursor = None,
     ):
         before = decode_cursor(cursor, datetime.fromisoformat, UUID)
-        rows = db(request).run(lambda conn: ledger(request).list_holds(conn, account_id, status, limit, before))
+        rows = run(request, lambda conn: ledger(request).list_holds(conn, account_id, status, limit, before))
         return page(rows, limit, key=lambda hold: (hold["created_at"], hold["id"]))
 
     # --- transactions -------------------------------------------------------------
@@ -368,107 +406,127 @@ def create_app(settings: Settings | None = None, *, run_migrations: bool = True,
     def transaction_location(transaction: dict) -> str:
         return f"/v1/transactions/{transaction['id']}"
 
-    @app.post("/v1/transactions", status_code=201, response_model=TransactionOut, tags=["transactions"])
+    @v1.post("/transactions", status_code=201, response_model=TransactionOut, tags=["transactions"])
     def post_transaction(body: TransactionIn, key: IdempotencyKey, request: Request):
         legs = [Leg(e.account_id, e.direction, e.amount) for e in body.entries]
-        outcome = db(request).run(
-            lambda conn: run_idempotent(
+
+        def work(conn):
+            return run_idempotent(
                 conn,
-                "transactions",
+                scoped(request, "transactions"),
                 key,
                 body,
                 lambda: ledger(request).post(conn, legs, body.description, body.metadata),
             )
-        )
-        return respond(outcome, transaction_location)
 
-    @app.post("/v1/transfers", status_code=201, response_model=TransactionOut, tags=["transactions"])
+        return respond(run(request, work), transaction_location)
+
+    @v1.post("/transfers", status_code=201, response_model=TransactionOut, tags=["transactions"])
     def transfer(body: TransferIn, key: IdempotencyKey, request: Request):
-        def work(conn):
+        def move(conn):
             return ledger(request).transfer(
                 conn, body.debit_account_id, body.credit_account_id, body.amount, body.description, body.metadata
             )
 
-        outcome = db(request).run(lambda conn: run_idempotent(conn, "transfers", key, body, lambda: work(conn)))
-        return respond(outcome, transaction_location)
+        def work(conn):
+            return run_idempotent(conn, scoped(request, "transfers"), key, body, lambda: move(conn))
 
-    @app.get("/v1/transactions", response_model=Page[TransactionOut], tags=["transactions"])
+        return respond(run(request, work), transaction_location)
+
+    @v1.get("/transactions", response_model=Page[TransactionOut], tags=["transactions"])
     def recent_transactions(request: Request, limit: Annotated[int, Query(ge=1, le=100)] = 20, cursor: Cursor = None):
         """Most recent transactions first."""
         before = decode_cursor(cursor, datetime.fromisoformat, UUID)
-        rows = db(request).run(lambda conn: ledger(request).recent_transactions(conn, limit, before))
+        rows = run(request, lambda conn: ledger(request).recent_transactions(conn, limit, before))
         return page(rows, limit, key=lambda transaction: (transaction["posted_at"], transaction["id"]))
 
-    @app.get("/v1/transactions/{transaction_id}", response_model=TransactionOut, tags=["transactions"])
+    @v1.get("/transactions/{transaction_id}", response_model=TransactionOut, tags=["transactions"])
     def get_transaction(transaction_id: UUID, request: Request):
-        return db(request).run(lambda conn: ledger(request).get_transaction(conn, transaction_id))
+        return run(request, lambda conn: ledger(request).get_transaction(conn, transaction_id))
 
-    @app.post(
-        "/v1/transactions/{transaction_id}/reversal",
+    @v1.post(
+        "/transactions/{transaction_id}/reversal",
         status_code=201,
         response_model=TransactionOut,
         tags=["transactions"],
     )
     def reverse(transaction_id: UUID, body: ReversalIn, key: IdempotencyKey, request: Request):
         payload = {"transaction_id": transaction_id, **body.model_dump()}
-        outcome = db(request).run(
-            lambda conn: run_idempotent(
-                conn, "reversals", key, payload, lambda: ledger(request).reverse(conn, transaction_id, body.description)
+
+        def work(conn):
+            return run_idempotent(
+                conn,
+                scoped(request, "reversals"),
+                key,
+                payload,
+                lambda: ledger(request).reverse(conn, transaction_id, body.description),
             )
-        )
-        return respond(outcome, transaction_location)
+
+        return respond(run(request, work), transaction_location)
 
     # --- holds --------------------------------------------------------------------
 
-    @app.post("/v1/holds", status_code=201, response_model=HoldOut, tags=["holds"])
+    @v1.post("/holds", status_code=201, response_model=HoldOut, tags=["holds"])
     def create_hold(body: HoldIn, key: IdempotencyKey, request: Request):
         def create(conn):
             expires_at = datetime.now(UTC) + timedelta(seconds=body.expires_in_seconds)
             return ledger(request).create_hold(conn, body.account_id, body.amount, expires_at, body.description)
 
-        outcome = db(request).run(lambda conn: run_idempotent(conn, "holds", key, body, lambda: create(conn)))
-        return respond(outcome, location=lambda hold: f"/v1/holds/{hold['id']}")
+        def work(conn):
+            return run_idempotent(conn, scoped(request, "holds"), key, body, lambda: create(conn))
 
-    @app.get("/v1/holds/{hold_id}", response_model=HoldOut, tags=["holds"])
+        return respond(run(request, work), location=lambda hold: f"/v1/holds/{hold['id']}")
+
+    @v1.get("/holds/{hold_id}", response_model=HoldOut, tags=["holds"])
     def get_hold(hold_id: UUID, request: Request):
-        return db(request).run(lambda conn: ledger(request).get_hold(conn, hold_id))
+        return run(request, lambda conn: ledger(request).get_hold(conn, hold_id))
 
-    @app.post("/v1/holds/{hold_id}/capture", response_model=CaptureOut, tags=["holds"])
+    @v1.post("/holds/{hold_id}/capture", response_model=CaptureOut, tags=["holds"])
     def capture(hold_id: UUID, body: CaptureIn, key: IdempotencyKey, request: Request):
         payload = {"hold_id": hold_id, **body.model_dump()}
 
-        def work(conn):
+        def settle(conn):
             return ledger(request).capture_hold(
                 conn, hold_id, body.destination_account_id, body.amount, body.description
             )
 
-        outcome = db(request).run(
-            lambda conn: run_idempotent(conn, "captures", key, payload, lambda: work(conn), status_code=200)
-        )
-        return respond(outcome)
+        def work(conn):
+            return run_idempotent(conn, scoped(request, "captures"), key, payload, lambda: settle(conn), 200)
 
-    @app.post("/v1/holds/{hold_id}/void", response_model=HoldOut, tags=["holds"])
+        return respond(run(request, work))
+
+    @v1.post("/holds/{hold_id}/void", response_model=HoldOut, tags=["holds"])
     def void(hold_id: UUID, request: Request, key: OptionalIdempotencyKey = None):
         # Without a key, a retried void whose first attempt succeeded gets HOLD_NOT_ACTIVE.
         def work(conn):
             if key is None:
                 return Outcome(200, jsonable_encoder(ledger(request).void_hold(conn, hold_id)), replayed=False)
             return run_idempotent(
-                conn, "voids", key, {"hold_id": hold_id}, lambda: ledger(request).void_hold(conn, hold_id), 200
+                conn,
+                scoped(request, "voids"),
+                key,
+                {"hold_id": hold_id},
+                lambda: ledger(request).void_hold(conn, hold_id),
+                200,
             )
 
-        return respond(db(request).run(work))
+        return respond(run(request, work))
 
     # --- operations ---------------------------------------------------------------
 
-    @app.get("/v1/reconciliation", tags=["operations"])
+    @v1.get("/reconciliation", tags=["operations"])
     def reconciliation(request: Request):
-        """Re-derives the books from raw entries and holds and reports any disagreement.
+        """Re-derives the caller's books from raw entries and holds and reports any disagreement.
 
         Synchronous: fine for small and medium ledgers. For big ones run ``tally
-        reconcile`` on a schedule instead of holding an HTTP request open.
+        reconcile`` (which checks every client's books) on a schedule instead.
         """
-        return jsonable_encoder(db(request).run(reconcile))
+        # Two transactions: reconcile() must start its own (REPEATABLE READ has to be its first statement).
+        run(request, lambda conn: None)
+        client_id = request.state.actor.client_id
+        return jsonable_encoder(db(request).run(lambda conn: reconcile(conn, client_id=client_id)))
+
+    app.include_router(v1)
 
     @app.get("/metrics", include_in_schema=False)
     def metrics():

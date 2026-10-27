@@ -15,13 +15,14 @@ After each run it checks the things that must never break under load:
 
 It exits 1 if any check fails, so CI can run it as a gate.
 
-Usage:
-  python3 scripts/load_test.py --base-url http://localhost:8000 --requests 5000 --concurrency 50
+Usage (the key comes from `tally create-client <name>`):
+  python3 scripts/load_test.py --api-key tly_... --base-url http://localhost:8000 --requests 5000 --concurrency 50
 """
 
 import argparse
 import http.client
 import json
+import os
 import random
 import statistics
 import sys
@@ -33,13 +34,14 @@ from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse
 
 _local = threading.local()
+API_KEY = ""  # set from --api-key / TALLY_API_KEY in main()
 
 # The only refusal a correct ledger gives under this load: a wallet ran out of money.
 EXPECTED = {"ok", "INSUFFICIENT_FUNDS"}
 
 
 def call(base, method, path, body=None, idempotent=False):
-    headers = {"Content-Type": "application/json"}
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {API_KEY}"}
     if idempotent:
         # Generated once per logical request: if the connection drops and we retry,
         # the same key guarantees the transfer still happens at most once.
@@ -121,7 +123,12 @@ def main():
     parser.add_argument("--wallets", type=int, default=200)
     parser.add_argument("--requests", type=int, default=5000)
     parser.add_argument("--concurrency", type=int, default=50)
+    parser.add_argument("--api-key", default=os.environ.get("TALLY_API_KEY"), help="default: $TALLY_API_KEY")
     args = parser.parse_args()
+    if not args.api_key:
+        parser.error("an API key is required: --api-key, or TALLY_API_KEY (create one with `tally create-client`)")
+    global API_KEY
+    API_KEY = args.api_key
     base = urlparse(args.base_url)
     deposit = 10_000
 

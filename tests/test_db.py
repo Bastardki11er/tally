@@ -23,7 +23,7 @@ def account_names(db) -> list[str]:
 
 
 def insert_account(conn, name: str) -> None:
-    conn.execute("INSERT INTO accounts (name, type, currency) VALUES (%s, 'asset', 'USD')", (name,))
+    conn.execute("INSERT INTO accounts (client_id, name, type, currency) VALUES (1, %s, 'asset', 'USD')", (name,))
 
 
 def test_work_commits_on_success_and_rolls_back_on_any_error(db):

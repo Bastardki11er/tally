@@ -10,10 +10,12 @@ import psycopg
 import pytest
 from hypothesis import settings
 
+from tally import auth
 from tally.db import Database, migrate
 from tally.ledger import Ledger
 
-TABLES = "accounts, transactions, entries, holds, idempotency_keys"
+TABLES = "api_clients, api_keys, audit_log, accounts, transactions, entries, holds, idempotency_keys"
+DEFAULT_CLIENT = 1  # created by migration 006, and again by reset()
 
 # Pull requests run 40 random operation sequences; `pytest --hypothesis-profile=thorough`
 # runs 500. print_blob makes a failure in CI print a @reproduce_failure line that
@@ -61,6 +63,7 @@ def reset(db: Database) -> None:
     def wipe(conn):
         conn.execute("SET LOCAL session_replication_role = replica")
         conn.execute(f"TRUNCATE {TABLES} RESTART IDENTITY CASCADE")
+        conn.execute("INSERT INTO api_clients (name) VALUES ('default')")  # id 1 again
 
     db.run(wipe)
 
@@ -71,11 +74,11 @@ def clean_database(db):
 
 
 class Books:
-    """Calls Ledger methods, each in its own committed transaction: ``books.transfer(1, 2, 500)``."""
+    """Calls one client's Ledger methods, each in its own committed transaction: ``books.transfer(1, 2, 500)``."""
 
-    def __init__(self, db: Database) -> None:
+    def __init__(self, db: Database, client_id: int = DEFAULT_CLIENT) -> None:
         self.db = db
-        self.ledger = Ledger()
+        self.ledger = Ledger(client_id)
 
     def __getattr__(self, name):
         method = getattr(self.ledger, name)
@@ -107,12 +110,18 @@ def wallet(books, cash):
 
 
 @pytest.fixture
-def client(migrated):
+def api_key(db):
+    """A key for the default client, whose books `books` and `wallet` write to."""
+    return db.run(lambda conn: auth.create_key(conn, "default"))[1]
+
+
+@pytest.fixture
+def client(migrated, api_key):
     from fastapi.testclient import TestClient
 
     from tally.api import create_app
     from tally.config import Settings
 
     app = create_app(Settings(database_url=migrated, pool_size=10), run_migrations=False, maintenance=False)
-    with TestClient(app) as test_client:
+    with TestClient(app, headers={"Authorization": f"Bearer {api_key}"}) as test_client:
         yield test_client
