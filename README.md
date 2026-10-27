@@ -17,7 +17,7 @@ hand-typed `UPDATE` can't corrupt the books.
 
 ![Tally console](docs/console.jpg)
 
-*The built-in console (`/`): reconciliation status (re-checked every minute and after each write), a journal-entry editor that totals debits and credits as you type, statements with running balances, holds, and a button that replays the last request with the same idempotency key.*
+*The built-in console (`/`): reconciliation status (re-checked every minute and after each write), a journal-entry editor that totals debits and credits as you type, statements with running balances, holds, and a button that replays the last request with the same idempotency key. Like any client it calls the API with a key (`tally demo` prints one).*
 
 ## Double-entry in 30 seconds
 
