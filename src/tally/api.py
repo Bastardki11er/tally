@@ -40,7 +40,7 @@ from prometheus_client import CONTENT_TYPE_LATEST
 from pydantic import AwareDatetime
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from . import __version__, auth, idempotency
+from . import __version__, auth, events, idempotency
 from .config import Settings
 from .db import Database, migrate
 from .errors import LedgerError, unprocessable
@@ -54,6 +54,7 @@ from .schemas import (
     BalanceOut,
     CaptureIn,
     CaptureOut,
+    EventOut,
     HoldIn,
     HoldOut,
     Page,
@@ -233,6 +234,8 @@ def _maintenance_loop(db: Database, ledger: Ledger, interval: float, stop: threa
             while db.run(lambda conn: ledger.expire_holds(conn)) == EXPIRY_BATCH_SIZE:
                 pass
             while db.run(idempotency.purge_expired) == idempotency.PURGE_BATCH_SIZE:
+                pass
+            while db.run(events.purge_expired) == events.PURGE_BATCH_SIZE:
                 pass
         except Exception:  # keep the loop alive; the next tick retries
             log.exception("maintenance run failed")
@@ -511,6 +514,22 @@ def create_app(settings: Settings | None = None, *, run_migrations: bool = True,
             )
 
         return respond(run(request, work))
+
+    # --- events -------------------------------------------------------------------
+
+    @v1.get("/events", response_model=Page[EventOut], tags=["events"])
+    def list_events(request: Request, limit: Limit = 100, cursor: Cursor = None):
+        """Every change to the caller's books, oldest first, in an order that never skips one.
+
+        Poll with ``next_cursor``. Unlike the other lists it never runs out: a short or
+        empty page means you're caught up, so keep the cursor and ask again later.
+        Events are kept for 7 days.
+        """
+        after = decode_cursor(cursor, int, int)
+        position = (str(after[0]), after[1]) if after else None
+        rows = run(request, lambda conn: events.read(conn, request.state.actor.client_id, position, limit))
+        data = [{"id": r["id"], "type": r["type"], "created_at": r["created_at"], "data": r["payload"]} for r in rows]
+        return {"data": data, "next_cursor": encode_cursor(int(rows[-1]["txid"]), rows[-1]["id"]) if rows else cursor}
 
     # --- operations ---------------------------------------------------------------
 
