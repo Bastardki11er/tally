@@ -1,6 +1,7 @@
 """The command line: exit codes a scheduler can act on, and a demo seed that's safe to rerun."""
 
 import json
+import os
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -140,11 +141,21 @@ def test_two_demos_at_once_seed_only_once(db):
 def test_serve_hands_its_options_to_uvicorn(monkeypatch):
     calls = []
     monkeypatch.setattr(uvicorn, "run", lambda app, **options: calls.append((app, options)))
+    # setenv records that the variable was absent, so the value serve sets is removed afterwards.
+    monkeypatch.setenv("PROMETHEUS_MULTIPROC_DIR", "")
 
     assert main(["serve", "--port", "9000", "--workers", "3"]) == EXIT_OK
-    assert calls == [
-        ("tally.api:create_app", {"factory": True, "host": "127.0.0.1", "port": 9000, "workers": 3}),
-    ]
+    options = {
+        "factory": True,
+        "host": "127.0.0.1",
+        "port": 9000,
+        "workers": 3,
+        "log_config": None,
+        "access_log": False,
+    }
+    assert calls == [("tally.api:serve_app", options)]
+    # Several worker processes: their metrics are summed through a shared directory.
+    assert os.path.isdir(os.environ["PROMETHEUS_MULTIPROC_DIR"])
 
 
 @pytest.mark.parametrize(

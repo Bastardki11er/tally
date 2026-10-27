@@ -18,6 +18,8 @@ import psycopg
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
+from .observability import DB_RETRIES
+
 log = logging.getLogger(__name__)
 
 T = TypeVar("T")
@@ -111,6 +113,7 @@ class Database:
             except RETRYABLE as error:
                 if attempt == attempts:
                     raise
+                DB_RETRIES.labels(type(error).__name__).inc()
                 # Exponential backoff with full jitter: transactions that collided once
                 # must not all retry at the same instant and collide again.
                 delay = random.uniform(0, 0.02 * 2**attempt)
