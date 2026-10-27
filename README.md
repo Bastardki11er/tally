@@ -13,7 +13,7 @@ and "no overdrafts" are enforced by **PostgreSQL itself** (deferred constraint t
 constraints, composite foreign keys), not just by application code. A buggy service, a bad script or a
 hand-typed `UPDATE` can't corrupt the books.
 
-**Stack:** Python 3.13 · FastAPI · PostgreSQL 17 · psycopg 3 (raw SQL, connection pool) · pytest · Hypothesis (stateful, model-based) · Testcontainers · Docker Compose · GitHub Actions
+**Stack:** Python 3.14 · FastAPI · PostgreSQL 17 · psycopg 3 (raw SQL, connection pool) · pytest · Hypothesis (stateful, model-based) · Testcontainers · Docker Compose · GitHub Actions
 
 ![Tally console](docs/console.jpg)
 
@@ -471,7 +471,7 @@ Tests are only worth what they catch, so the important ones were checked by plan
   six passed with the bug in place. Now all six runs fail.
 - The maintenance loop processing one batch per run, or letting an exception kill the thread: each breaks a test.
 
-CI runs the suite on Python 3.11 (the oldest `pyproject.toml` allows) and 3.13 (what the image runs), plus
+CI runs the suite on Python 3.11 (the oldest `pyproject.toml` allows) and 3.14 (what the image runs), plus
 lint and the JavaScript tests, then builds the image, starts the Compose stack, runs the load test against it
 and `tally reconcile` inside the container. Testing 3.11 paid off at once: the framework's error codes were
 derived from `HTTPStatus` names, which Python 3.13 renamed (`413` was `REQUEST_ENTITY_TOO_LARGE`), so the same
