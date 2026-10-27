@@ -176,6 +176,26 @@ holding the account locks. Checking the key inside the request's own transaction
 trigger brought the cost down to roughly 6% on the hot-account scenario and 7-16% on spread traffic (measured A/B
 against the previous commit on the same machine; run-to-run noise here is about 10%).
 
+## Events (transactional outbox)
+
+Other services usually need to know when the books change: to send a receipt, update a search index, notify a
+merchant. Writing to the database and then publishing to a broker is two writes that can't both be guaranteed,
+so a crash in between either loses an event or announces a change that was rolled back. Here every change also
+inserts a row into `outbox_events` **in the same database transaction**: account opened, transaction posted or
+reversed (with its entries), hold created, captured, voided or expired. Triggers do it, so no code path can forget.
+Consumers poll `GET /v1/events?cursor=...` and get their own client's events; a relay could forward the same
+table to Kafka.
+
+The subtle part is reading them in order without gaps. Ids are handed out at insert time, not commit time, so
+event 101 can become visible before event 100; a consumer that moved its cursor past 101 would never see 100.
+Each event records its transaction's `xid8`, and readers only get events from transactions older than every
+transaction still running (`pg_snapshot_xmin(pg_current_snapshot())`), ordered by `(txid, id)`: nothing can ever
+commit behind that line. `test_a_later_commit_never_overtakes_an_earlier_transaction` holds a transaction open,
+commits a younger one, and checks that the younger event waits and then arrives after the older one; dropping the
+watermark makes it fail. The price is that a running transaction delays younger events until it finishes, which is
+milliseconds here (and at most a minute: idle transactions are cut off). Read-only transactions, reconciliation's
+long one included, don't hold the line back. Events are kept 7 days and purged in batches.
+
 ## Concurrency
 
 Every operation locks the account rows it touches with `SELECT ... FOR UPDATE`, **always in ascending
@@ -271,6 +291,7 @@ Every `/v1` route needs an API key: `Authorization: Bearer tly_...`. See [Client
 | `POST` | `/v1/holds` 🔑 | Reserve funds (card authorization), with expiry |
 | `POST` | `/v1/holds/{id}/capture` 🔑 | Settle a hold, optionally for less; the rest is released |
 | `POST` | `/v1/holds/{id}/void` 🗝️ | Release a hold |
+| `GET` | `/v1/events?cursor=` | Every change to your books, oldest first, without gaps (see [Events](#events-transactional-outbox)) |
 | `GET` | `/v1/reconciliation` | Re-derive every balance from raw entries and report any mismatch |
 | `GET` | `/metrics` | Prometheus metrics (see [Observability](#observability)) |
 
@@ -399,7 +420,7 @@ node --test 'tests/js/*.test.js'   # the console's money and idempotency logic (
 # export DOCKER_HOST=unix://$HOME/.docker/run/docker.sock
 ```
 
-206 Python tests, all against a real PostgreSQL because the rules under test live in the database, plus 11 for the console's JavaScript. Branch coverage is 98%; warnings fail the run.
+215 Python tests, all against a real PostgreSQL because the rules under test live in the database, plus 11 for the console's JavaScript. Branch coverage is 98%; warnings fail the run.
 
 | Suite | What it covers |
 |---|---|
@@ -410,6 +431,7 @@ node --test 'tests/js/*.test.js'   # the console's money and idempotency logic (
 | `test_api.py` (9) | HTTP contract, idempotent replay, key reuse, problem details, pagination, holds, reconciliation |
 | `test_api_errors.py` (22) | A real row lock becomes `503 LOCK_TIMEOUT`; timeouts, pool exhaustion and outages become 503s; constraint names and crashes don't leak; oversized and chunked bodies get 413; naive timestamps and forged cursors are rejected; paging 120 holds that share one timestamp; optional idempotency; `Location` headers; error codes that don't depend on the Python version |
 | `test_tenancy.py` (13) | Missing, malformed, unknown and revoked keys get `401`; key rotation; only a hash stored; another client's accounts, transactions and holds are `404` for every read and write and no money moves; idempotency keys per client; reconciliation per client; audit rows naming key and request, none for replays or failures, keyless rows for changes made around the API |
+| `test_events.py` (9) | One event per change with the transaction's entries; every kind of change; nothing for a rollback or a commit-time failure; per client; paging resumes exactly; an older transaction committing later is never skipped; batched purge; forged cursors |
 | `test_cli.py` (21) | Exit codes (0 / 1 for discrepancies / 2 for a database that's down, unmigrated or edited), fast failure without a pool timeout, demo refusing a non-empty ledger, rolling back when it fails halfway, two demos at once seeding once, argument and config validation, Ctrl-C; API keys: only the key on stdout, revoke and list, unknown clients and keys, taken names |
 | `test_console.py` (3), `tests/js/` (11) | The console's CSP and cache revalidation; exact money parsing and formatting per currency; one idempotency key per intent (double clicks send one request, retries reuse the key, definite answers retire it) |
 | `test_idempotency.py` (8) | Run once and replay, key reuse, per-operation scope, failed requests not remembered, a retry racing the original, a key purged mid-claim, batched purge |
@@ -446,9 +468,11 @@ migrations/003_*, 004_*     hardening: TRUNCATE guard, fixed account identity, h
                             DB-stamped timestamps, metadata CHECKs (added NOT VALID, then validated)
 migrations/005_*            balances and held amounts maintained by triggers; direct writes refused
 migrations/006_*, 007_*     API clients, keys, the audit log; tenant foreign keys added without blocking writes
+migrations/008_*            the outbox: an event per change, written by triggers in the same transaction
 src/tally/
 ├── ledger.py               validation, ordered row locks, posting, holds, reversals, statements; one client's books
 ├── auth.py                 API clients and keys (hashed), and who is acting
+├── events.py               reading the outbox in commit-safe order, and purging it
 ├── idempotency.py          idempotency keys in the same transaction as the operation
 ├── reconciliation.py       re-checks every trigger-enforced rule in one REPEATABLE READ snapshot
 ├── db.py                   connection pool with timeouts and idle checks, deadlock retry, migration runner

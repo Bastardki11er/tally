@@ -147,6 +147,13 @@ class BalanceOut(BaseModel):
     balance: int
 
 
+class EventOut(BaseModel):
+    id: int
+    type: str = Field(examples=["transaction.posted", "hold.captured", "account.created"])
+    created_at: datetime
+    data: dict[str, Any] = Field(description="The transaction (with its entries), hold or account, as it is now")
+
+
 class Page(BaseModel, Generic[T]):
     data: list[T]
     next_cursor: str | None = Field(

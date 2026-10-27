@@ -14,7 +14,7 @@ from tally import auth
 from tally.db import Database, migrate
 from tally.ledger import Ledger
 
-TABLES = "api_clients, api_keys, audit_log, accounts, transactions, entries, holds, idempotency_keys"
+TABLES = "api_clients, api_keys, audit_log, outbox_events, accounts, transactions, entries, holds, idempotency_keys"
 DEFAULT_CLIENT = 1  # created by migration 006, and again by reset()
 
 # Pull requests run 40 random operation sequences; `pytest --hypothesis-profile=thorough`
