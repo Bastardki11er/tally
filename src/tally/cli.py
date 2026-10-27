@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+import tempfile
 from datetime import UTC, datetime, timedelta
 
 import psycopg
@@ -118,9 +120,22 @@ def migrate_command(args: argparse.Namespace, settings: Settings) -> int:
 def serve_command(args: argparse.Namespace, settings: Settings) -> int:
     import uvicorn  # only this command needs it
 
+    if args.workers > 1:
+        # Each worker process keeps its own metrics; they write them here, and /metrics
+        # in any worker reports the sum. Must be set before the workers start.
+        os.environ["PROMETHEUS_MULTIPROC_DIR"] = tempfile.mkdtemp(prefix="tally-metrics-")
     # Each worker builds its own app and reads the environment again. main() read it
     # once already, so bad configuration fails here, before any worker starts.
-    uvicorn.run("tally.api:create_app", factory=True, host=args.host, port=args.port, workers=args.workers)
+    # The app logs one JSON line per request itself, so uvicorn's own logging is off.
+    uvicorn.run(
+        "tally.api:serve_app",
+        factory=True,
+        host=args.host,
+        port=args.port,
+        workers=args.workers,
+        log_config=None,
+        access_log=False,
+    )
     return EXIT_OK
 
 

@@ -238,6 +238,7 @@ per-transaction consistency on that one account.
 | `POST` | `/v1/holds/{id}/capture` 🔑 | Settle a hold, optionally for less; the rest is released |
 | `POST` | `/v1/holds/{id}/void` 🗝️ | Release a hold |
 | `GET` | `/v1/reconciliation` | Re-derive every balance from raw entries and report any mismatch |
+| `GET` | `/metrics` | Prometheus metrics (see [Observability](#observability)) |
 
 🔑 = requires `Idempotency-Key`; 🗝️ = accepts one. Without a key, a retried void whose first attempt
 succeeded gets `409 HOLD_NOT_ACTIVE`, and a retried account creation opens a second account. Created
@@ -283,6 +284,27 @@ small, but it has to get the same details right as any client that moves money:
   that only allows its own scripts, so an escaping slip still couldn't run injected code. Files are served
   `Cache-Control: no-cache` (a cheap 304 when unchanged), so after a deploy a browser can't run a cached
   `app.js` against a new `index.html`.
+
+## Observability
+
+- **Request IDs.** Every response carries `X-Request-ID`: the caller's own, if it's a plain token, otherwise a
+  new one. Error bodies include it, and so does every log line written while the request runs, so the ID a
+  client quotes in a bug report finds everything the server did about it.
+- **JSON logs.** One line per request (`method`, `route`, `status`, `ms`, `request_id`), plus warnings and
+  errors with their tracebacks. `/health` and `/metrics` are left out of the access log, since they're polled
+  every few seconds.
+- **`/metrics`** in Prometheus format:
+
+| Metric | What it shows |
+|---|---|
+| `tally_http_request_duration_seconds{method, route, status}` | Latency histogram per route template (`/v1/accounts/{account_id}`, not one series per id) |
+| `tally_account_lock_wait_seconds` | Time spent acquiring account row locks: the number that climbs when an account gets hot |
+| `tally_db_retries_total{error}` | Transactions retried after a deadlock or serialization failure; should stay at 0 |
+| `tally_problems_total{code}` | Error responses by code (`INSUFFICIENT_FUNDS`, `LOCK_TIMEOUT`, ...) |
+
+Under `tally serve --workers N` each worker is its own process with its own counters. The CLI points
+`PROMETHEUS_MULTIPROC_DIR` at a fresh directory before the workers start, so `/metrics` reports the sum over all
+of them whichever worker answers (checked: 20 requests spread over 2 workers read as 20 on every scrape).
 
 ## Run it
 
@@ -342,7 +364,7 @@ node --test 'tests/js/*.test.js'   # the console's money and idempotency logic (
 # export DOCKER_HOST=unix://$HOME/.docker/run/docker.sock
 ```
 
-173 Python tests, all against a real PostgreSQL because the rules under test live in the database, plus 11 for the console's JavaScript. Branch coverage is 98%; warnings fail the run.
+181 Python tests, all against a real PostgreSQL because the rules under test live in the database, plus 11 for the console's JavaScript. Branch coverage is 98%; warnings fail the run.
 
 | Suite | What it covers |
 |---|---|
@@ -356,6 +378,7 @@ node --test 'tests/js/*.test.js'   # the console's money and idempotency logic (
 | `test_console.py` (3), `tests/js/` (11) | The console's CSP and cache revalidation; exact money parsing and formatting per currency; one idempotency key per intent (double clicks send one request, retries reuse the key, definite answers retire it) |
 | `test_idempotency.py` (8) | Run once and replay, key reuse, per-operation scope, failed requests not remembered, a retry racing the original, a key purged mid-claim, batched purge |
 | `test_maintenance.py` (5) | The background job: drains a backlog of overdue holds in one run, forgets keys past the replay window, survives a failed run, stops promptly on shutdown |
+| `test_observability.py` (8) | Request IDs generated, echoed or replaced, and quoted in errors; one JSON access line per request; latency per route template; errors by code; lock waits; retried transactions |
 | `test_reconciliation.py` (9) | Damages the ledger past every trigger (replica mode) and checks each kind of damage is reported; capped lists with exact totals; one consistent snapshot while transfers commit |
 | `test_migrations.py` (10) | Ordered, idempotent migrations; valid concurrent indexes; the hot queries use them; four instances migrating at once without deadlocking; edited migrations refused |
 | `test_db.py` (8), `test_config.py` (11) | Commit/rollback, deadlock retries in fresh transactions, lock timeouts, replacing dropped connections, idle-only pings; config parsing, validation and password redaction |
@@ -392,6 +415,7 @@ src/tally/
 ├── reconciliation.py       re-checks every trigger-enforced rule in one REPEATABLE READ snapshot
 ├── db.py                   connection pool with timeouts and idle checks, deadlock retry, migration runner
 ├── api.py, schemas.py      FastAPI routes, Pydantic models, RFC 9457 errors
+├── observability.py        request IDs, JSON logs, Prometheus metrics (summed across worker processes)
 ├── cli.py                  tally migrate | serve | reconcile | demo
 └── static/                 the console (plain JS modules, no build step)
 scripts/load_test.py        concurrent load test: answers, reconciliation, conservation; exits 1 on any failure

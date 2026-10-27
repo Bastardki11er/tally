@@ -28,8 +28,9 @@ import psycopg_pool
 from fastapi import FastAPI, Header, Query, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
+from prometheus_client import CONTENT_TYPE_LATEST
 from pydantic import AwareDatetime
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -39,6 +40,7 @@ from .db import Database, migrate
 from .errors import LedgerError, unprocessable
 from .idempotency import Outcome, run_idempotent
 from .ledger import EXPIRY_BATCH_SIZE, Ledger, Leg
+from .observability import PROBLEMS, RequestContext, configure_logging, metrics_text, request_id
 from .reconciliation import reconcile
 from .schemas import (
     AccountIn,
@@ -102,7 +104,10 @@ TRANSIENT_ERRORS: dict[type[Exception], tuple[str, str, int]] = {
 
 def problem(status: int, code: str, detail: str, headers: dict | None = None, **extra) -> JSONResponse:
     """RFC 9457 problem details, with a stable ``code`` clients can switch on."""
+    PROBLEMS.labels(code).inc()
     body = {"type": "about:blank", "title": code, "status": status, "detail": detail, "code": code, **extra}
+    if rid := request_id.get():
+        body["request_id"] = rid  # what a client quotes when reporting the failure
     return JSONResponse(body, status_code=status, media_type="application/problem+json", headers=headers)
 
 
@@ -215,6 +220,12 @@ def _maintenance_loop(db: Database, ledger: Ledger, interval: float, stop: threa
             log.exception("maintenance run failed")
 
 
+def serve_app() -> FastAPI:
+    """The app as `tally serve` runs it: each worker process logs JSON lines, then builds the app."""
+    configure_logging()
+    return create_app()
+
+
 def create_app(settings: Settings | None = None, *, run_migrations: bool = True, maintenance: bool = True) -> FastAPI:
     settings = settings or Settings.from_env()
 
@@ -251,6 +262,7 @@ def create_app(settings: Settings | None = None, *, run_migrations: bool = True,
         responses={"default": {"model": Problem, "description": "Error, as RFC 9457 problem details"}},
     )
     app.add_middleware(BodySizeLimit, max_bytes=MAX_BODY_BYTES)
+    app.add_middleware(RequestContext)  # outermost: even a refused body gets a request ID
 
     app.add_exception_handler(StarletteHTTPException, http_problem)
 
@@ -457,6 +469,10 @@ def create_app(settings: Settings | None = None, *, run_migrations: bool = True,
         reconcile`` on a schedule instead of holding an HTTP request open.
         """
         return jsonable_encoder(db(request).run(reconcile))
+
+    @app.get("/metrics", include_in_schema=False)
+    def metrics():
+        return Response(metrics_text(), media_type=CONTENT_TYPE_LATEST)
 
     @app.get("/health", tags=["operations"])
     def health(request: Request):

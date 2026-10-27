@@ -29,6 +29,7 @@ from psycopg import Connection
 from psycopg.types.json import Jsonb
 
 from .errors import conflict, not_found, unprocessable
+from .observability import LOCK_WAIT_SECONDS
 
 Direction = Literal["debit", "credit"]
 AccountType = Literal["asset", "liability", "equity", "revenue", "expense"]
@@ -407,10 +408,11 @@ class Ledger:
     def _lock_accounts(self, conn: Connection, account_ids: set[int]) -> dict[int, dict[str, Any]]:
         # ORDER BY id + FOR UPDATE takes the row locks in ascending id order, the same
         # order in every code path, which is what rules out deadlocks.
-        rows = conn.execute(
-            f"SELECT {ACCOUNT_COLUMNS} FROM accounts WHERE id = ANY(%s) ORDER BY id FOR UPDATE",
-            (sorted(account_ids),),
-        ).fetchall()
+        with LOCK_WAIT_SECONDS.time():
+            rows = conn.execute(
+                f"SELECT {ACCOUNT_COLUMNS} FROM accounts WHERE id = ANY(%s) ORDER BY id FOR UPDATE",
+                (sorted(account_ids),),
+            ).fetchall()
         found = {row["id"]: row for row in rows}
         missing = sorted(account_ids - found.keys())
         if missing:
