@@ -17,7 +17,7 @@ expiry); any lookup it makes finds nothing and any insert fails, so forgetting t
 client fails closed. The database enforces the same boundary (migrations 006 and 007).
 
 Concurrency: every operation locks the account rows it touches with
-``SELECT ... FOR UPDATE``, always in ascending id order. Two transfers between
+``SELECT ... FOR NO KEY UPDATE``, always in ascending id order. Two transfers between
 the same accounts in opposite directions therefore queue up instead of
 deadlocking, and a balance is checked and changed under the same lock, so no
 update is ever lost.
@@ -25,6 +25,8 @@ update is ever lost.
 
 from __future__ import annotations
 
+import logging
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal
@@ -35,7 +37,7 @@ from psycopg import Connection
 from psycopg.types.json import Jsonb
 
 from .errors import conflict, not_found, unprocessable
-from .observability import LOCK_WAIT_SECONDS
+from .observability import LOCK_WAIT_SECONDS, SETTLED
 
 Direction = Literal["debit", "credit"]
 AccountType = Literal["asset", "liability", "equity", "revenue", "expense"]
@@ -46,9 +48,16 @@ ACCOUNT_COLUMNS = (
 TRANSACTION_COLUMNS = "id, description, metadata, reverses_id, posted_at"
 ENTRY_COLUMNS = "id, account_id, direction, amount, currency, balance_after, posted_at"
 EXPIRY_BATCH_SIZE = 500
+# Payments settled per batch: one transaction with up to this many debits and one credit.
+# The deferred balance check runs once per entry over the whole transaction, so cost grows
+# with the square of the batch; 100 (the API's own entry limit) keeps a batch to milliseconds.
+SETTLE_BATCH_SIZE = 100
+
+log = logging.getLogger(__name__)
 
 HOLD_COLUMNS = (
-    "id, account_id, amount, status, description, expires_at, captured_transaction_id, created_at, updated_at"
+    "id, account_id, amount, status, description, expires_at, captured_transaction_id, settle_to_account_id, "
+    "created_at, updated_at"
 )
 
 
@@ -173,9 +182,21 @@ class Ledger:
     # --- holds --------------------------------------------------------------------
 
     def create_hold(
-        self, conn: Connection, account_id: int, amount: int, expires_at: datetime, description: str = ""
+        self,
+        conn: Connection,
+        account_id: int,
+        amount: int,
+        expires_at: datetime,
+        description: str = "",
+        settle_to: int | None = None,
     ) -> dict:
-        """Reserves funds for a later capture: they stay in the balance but are no longer available."""
+        """Reserves funds for a later capture: they stay in the balance but are no longer available.
+
+        With ``settle_to`` the hold is a payment to that account, captured by the next
+        settlement batch (``settle_holds``) instead of by a client. Only the payer's row is
+        locked: the destination is read without a lock (its currency and owner can't
+        change), which is the whole point when thousands of payers share one destination.
+        """
         require_positive_amount(amount)
         # A naive datetime would be read in the database session's time zone, which can
         # shift the expiry by hours without any error.
@@ -183,16 +204,24 @@ class Ledger:
             raise unprocessable("INVALID_EXPIRY", "expires_at must include a time zone")
         if expires_at <= datetime.now(UTC):
             raise unprocessable("INVALID_EXPIRY", f"expires_at must be in the future, got {expires_at.isoformat()}")
+        if settle_to is not None:
+            if settle_to == account_id:
+                raise unprocessable("SAME_ACCOUNT", "A payment's destination must differ from the paying account")
+            destination = self.get_account(conn, settle_to)  # no lock: see above
         account = self._lock_accounts(conn, {account_id})[account_id]
+        if settle_to is not None and destination["currency"] != account["currency"]:
+            raise unprocessable(
+                "CURRENCY_MISMATCH", f"Cannot pay a {destination['currency']} account from a {account['currency']} one"
+            )
         if not account["allow_negative"] and account["available"] < amount:
             raise conflict(
                 "INSUFFICIENT_FUNDS", f"Account {account_id} has {account['available']} available, hold needs {amount}"
             )
         # The database adds an active hold to the account's held amount.
         return conn.execute(
-            f"INSERT INTO holds (account_id, amount, expires_at, description) VALUES (%s, %s, %s, %s) "
-            f"RETURNING {HOLD_COLUMNS}",
-            (account_id, amount, expires_at, description),
+            f"INSERT INTO holds (account_id, amount, expires_at, description, settle_to_account_id) "
+            f"VALUES (%s, %s, %s, %s, %s) RETURNING {HOLD_COLUMNS}",
+            (account_id, amount, expires_at, description, settle_to),
         ).fetchone()
 
     def capture_hold(
@@ -255,6 +284,67 @@ class Ledger:
         self._lock_accounts(conn, {hold["account_id"] for hold in expired}, any_client=True)
         conn.execute("UPDATE holds SET status = 'expired' WHERE id = ANY(%s)", ([h["id"] for h in expired],))
         return len(expired)
+
+    def settle_holds(self, conn: Connection, limit: int = SETTLE_BATCH_SIZE) -> int:
+        """Settles one batch of pending payments; returns how many. Safe on several instances at once.
+
+        Each destination gets one transaction per batch: a debit from every payer, then one
+        credit for the total. So the destination's row is locked once per batch instead of
+        once per payment. Global, like expiry: each transaction belongs to its holds' client.
+        """
+        holds = conn.execute(
+            f"SELECT {HOLD_COLUMNS}, client_id FROM holds "
+            "WHERE status = 'active' AND settle_to_account_id IS NOT NULL AND expires_at > now() "
+            "ORDER BY created_at LIMIT %s FOR UPDATE SKIP LOCKED",
+            (limit,),
+        ).fetchall()
+        if not holds:
+            return 0
+        # Same lock order as everywhere else: holds first, then accounts in id order.
+        involved = {h["account_id"] for h in holds} | {h["settle_to_account_id"] for h in holds}
+        accounts = self._lock_accounts(conn, involved, any_client=True)
+
+        by_destination: dict[tuple[int, int], list[dict]] = defaultdict(list)
+        for hold in holds:
+            by_destination[(hold["client_id"], hold["settle_to_account_id"])].append(hold)
+        for (client_id, destination), batch in by_destination.items():
+            # The API refuses such payments; one written around it would fail its batch on
+            # every run and stall settlement for everyone, so it is cancelled instead.
+            mismatched = [
+                h for h in batch if accounts[h["account_id"]]["currency"] != accounts[destination]["currency"]
+            ]
+            if mismatched:
+                log.error("voiding %d payment(s) whose currency doesn't match account %d", len(mismatched), destination)
+                ids = [h["id"] for h in mismatched]
+                conn.execute("UPDATE holds SET status = 'voided' WHERE id = ANY(%s)", (ids,))
+                batch = [h for h in batch if h not in mismatched]
+                if not batch:
+                    continue
+            legs = [
+                Leg(h["account_id"], opposite(accounts[h["account_id"]]["normal_side"]), h["amount"]) for h in batch
+            ]
+            # The destination takes the other side of the payers' legs (summed before any is added).
+            totals = {d: sum(leg.amount for leg in legs if leg.direction == d) for d in ("debit", "credit")}
+            legs += [Leg(destination, opposite(d), total) for d, total in totals.items() if total]
+            # Check against the funds as they'll be once these reservations are released.
+            released = dict(accounts)
+            for hold in batch:
+                source = released[hold["account_id"]]
+                released[hold["account_id"]] = {**source, "held": source["held"] - hold["amount"]}
+            self._check_postable(released, legs)
+
+            tenant = Ledger(client_id)
+            transaction = tenant._insert_transaction(
+                conn, f"Settlement of {len(batch)} payments", {"payments": len(batch)}
+            )
+            # Capturing releases each reservation (trigger), so it happens before the entries.
+            conn.execute(
+                "UPDATE holds SET status = 'captured', captured_transaction_id = %s WHERE id = ANY(%s)",
+                (transaction["id"], [h["id"] for h in batch]),
+            )
+            tenant._insert_entries(conn, transaction, accounts, legs)
+            SETTLED.inc(len(batch))
+        return len(holds)
 
     def get_hold(self, conn: Connection, hold_id: UUID) -> dict:
         hold = conn.execute(
@@ -424,13 +514,19 @@ class Ledger:
     def _lock_accounts(
         self, conn: Connection, account_ids: set[int], any_client: bool = False
     ) -> dict[int, dict[str, Any]]:
-        # ORDER BY id + FOR UPDATE takes the row locks in ascending id order, the same
-        # order in every code path, which is what rules out deadlocks. Only global
-        # maintenance (any_client) may lock accounts outside the ledger's own client.
+        # ORDER BY id takes the row locks in ascending id order, the same order in every
+        # code path, which is what rules out deadlocks. Only global maintenance
+        # (any_client) may lock accounts outside the ledger's own client.
+        # FOR NO KEY UPDATE, not FOR UPDATE: we only change balance and held, never a key,
+        # and the weaker lock still excludes every other locker here, but it doesn't block
+        # the FOR KEY SHARE lock a foreign key check takes. A payment to a merchant checks
+        # its settle_to key against the merchant's row; with FOR UPDATE it would queue
+        # behind the settler and every transfer to that merchant, which is the queue
+        # batched settlement exists to avoid.
         with LOCK_WAIT_SECONDS.time():
             rows = conn.execute(
                 f"SELECT {ACCOUNT_COLUMNS} FROM accounts WHERE id = ANY(%s) AND (%s OR client_id = %s) "
-                f"ORDER BY id FOR UPDATE",
+                f"ORDER BY id FOR NO KEY UPDATE",
                 (sorted(account_ids), any_client, self.client_id),
             ).fetchall()
         found = {row["id"]: row for row in rows}

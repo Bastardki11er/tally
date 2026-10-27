@@ -105,6 +105,11 @@ class HoldIn(BaseModel):
     amount: Amount
     expires_in_seconds: Annotated[int, Field(ge=1, le=30 * 24 * 3600)] = 7 * 24 * 3600
     description: Description = ""
+    settle_to_account_id: AccountId | None = Field(
+        None,
+        description="Makes the hold a payment to this account, settled with others in the next batch: "
+        "for paying hot accounts (merchants) without queueing on their row lock",
+    )
 
 
 class CaptureIn(BaseModel):
@@ -121,6 +126,7 @@ class HoldOut(BaseModel):
     description: str
     expires_at: datetime
     captured_transaction_id: UUID | None
+    settle_to_account_id: int | None
     created_at: datetime
     updated_at: datetime
 

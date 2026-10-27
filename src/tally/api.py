@@ -45,7 +45,7 @@ from .config import Settings
 from .db import Database, migrate
 from .errors import LedgerError, unprocessable
 from .idempotency import Outcome, run_idempotent
-from .ledger import EXPIRY_BATCH_SIZE, Ledger, Leg
+from .ledger import EXPIRY_BATCH_SIZE, SETTLE_BATCH_SIZE, Ledger, Leg
 from .observability import PROBLEMS, RequestContext, configure_logging, metrics_text, request_id
 from .reconciliation import reconcile
 from .schemas import (
@@ -231,6 +231,9 @@ def _maintenance_loop(db: Database, ledger: Ledger, interval: float, stop: threa
     while not stop.wait(interval):
         try:
             # A full batch means there may be more: keep going until one comes back short.
+            # Payments first: they're what someone is waiting for.
+            while db.run(lambda conn: ledger.settle_holds(conn)) == SETTLE_BATCH_SIZE:
+                pass
             while db.run(lambda conn: ledger.expire_holds(conn)) == EXPIRY_BATCH_SIZE:
                 pass
             while db.run(idempotency.purge_expired) == idempotency.PURGE_BATCH_SIZE:
@@ -265,7 +268,7 @@ def create_app(settings: Settings | None = None, *, run_migrations: bool = True,
         if maintenance:
             threading.Thread(
                 target=_maintenance_loop,
-                # No client: expiry sweeps every client's holds.
+                # No client: settlement and expiry sweep every client's holds.
                 args=(db, Ledger(), settings.maintenance_interval_seconds, stop),
                 daemon=True,
                 name="tally-maintenance",
@@ -473,7 +476,9 @@ def create_app(settings: Settings | None = None, *, run_migrations: bool = True,
     def create_hold(body: HoldIn, key: IdempotencyKey, request: Request):
         def create(conn):
             expires_at = datetime.now(UTC) + timedelta(seconds=body.expires_in_seconds)
-            return ledger(request).create_hold(conn, body.account_id, body.amount, expires_at, body.description)
+            return ledger(request).create_hold(
+                conn, body.account_id, body.amount, expires_at, body.description, body.settle_to_account_id
+            )
 
         def work(conn):
             return run_idempotent(conn, scoped(request, "holds"), key, body, lambda: create(conn))
