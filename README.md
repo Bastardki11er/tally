@@ -1,6 +1,6 @@
 # Tally
 
-[![CI](https://github.com/Bastardki11er/tally/actions/workflows/ci.yml/badge.svg)](https://github.com/Bastardki11er/tally/actions/workflows/ci.yml)
+[![CI](https://github.com/Lovio-Huang/tally/actions/workflows/ci.yml/badge.svg)](https://github.com/Lovio-Huang/tally/actions/workflows/ci.yml)
 ![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-blue)
 ![PostgreSQL 17](https://img.shields.io/badge/PostgreSQL-17-336791)
 
